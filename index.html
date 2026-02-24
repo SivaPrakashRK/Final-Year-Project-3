@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cognitive Canvas</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- LOADING OVERLAY -->
+    <div id="loading-overlay" class="hidden">
+        <div class="spinner-ring"></div>
+        <div id="loading-label">Analysing entry…</div>
+    </div>
+
+    <div class="app-layout">
+
+        <!-- ROW 1: TOP COMMAND BAR -->
+        <header class="top-command-bar">
+            <div class="logo-mark">
+                <span>Cognitive Canvas</span>
+            </div>
+
+            <div class="search-container">
+                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <input type="text" id="search-input" placeholder="Search entries, tags, or themes…">
+            </div>
+
+            <div class="filter-controls">
+                <span class="filter-label">Wires:</span>
+                <button class="filter-chip active" data-type="semantic">
+                    <span class="dot dot-semantic"></span> Semantic
+                </button>
+                <button class="filter-chip active" data-type="compensatory">
+                    <span class="dot dot-compensatory"></span> Compensatory
+                </button>
+                <button class="filter-chip active" data-type="contextual">
+                    <span class="dot dot-contextual"></span> Contextual
+                </button>
+            </div>
+        </header>
+
+        <!-- ROW 2 LEFT: GRAPH CANVAS -->
+        <main class="graph-panel">
+            <svg id="graph-svg"></svg>
+            <div class="graph-legend">
+                <div class="legend-item"><span class="legend-line line-chrono"></span> Chronological</div>
+                <div class="legend-item"><span class="legend-line line-semantic"></span> Semantic</div>
+                <div class="legend-item"><span class="legend-line line-compensatory"></span> Compensatory</div>
+                <div class="legend-item"><span class="legend-line line-contextual"></span> Contextual</div>
+                <div class="legend-item"><span class="legend-dot shape-diary">◇</span> Thought Diary</div>
+            </div>
+        </main>
+
+        <!-- ROW 2 RIGHT: ENTRY PANEL -->
+        <aside class="entry-panel">
+            <div class="entry-panel-scroll">
+
+                <div class="mode-switcher">
+                    <button class="mode-btn active" data-mode="freeform">Freeform</button>
+                    <button class="mode-btn" data-mode="diary">Thought Diary</button>
+                </div>
+
+                <!-- FREEFORM FORM -->
+                <form id="form-freeform" class="entry-form">
+                    <div class="form-group">
+                        <textarea id="ff-text" placeholder="What's on your mind?..." rows="6" required></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Tags</label>
+                        <div class="tags-input-wrap">
+                            <div class="tags-container" id="ff-tags-container"></div>
+                            <input type="text" id="ff-tag-input" placeholder="Add tag (Press Enter or comma)">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="submit-btn base-submit">Log Thought <span
+                            class="arrow">→</span></button>
+                </form>
+
+                <!-- THOUGHT DIARY FORM (WIZARD) -->
+                <form id="form-diary" class="entry-form hidden">
+                    <div class="wizard-progress">
+                        <div class="step-label" id="diary-step-label">Step 1 of 6</div>
+                        <div class="dots-container">
+                            <span class="step-dot active"></span>
+                            <span class="step-dot"></span>
+                            <span class="step-dot"></span>
+                            <span class="step-dot"></span>
+                            <span class="step-dot"></span>
+                            <span class="step-dot"></span>
+                        </div>
+                    </div>
+
+                    <!-- Step 1 -->
+                    <div class="wizard-step active" data-step="1">
+                        <label>What was the situation?</label>
+                        <textarea id="diary-situation" placeholder="Describe the trigger or context..."
+                            rows="4"></textarea>
+                    </div>
+
+                    <!-- Step 2 -->
+                    <div class="wizard-step hidden" data-step="2">
+                        <label>What was your first thought?</label>
+                        <textarea id="diary-thought" placeholder="The automatic thought that popped into your head..."
+                            rows="3"></textarea>
+
+                        <label class="slider-label">How strongly do you believe this? (<span
+                                id="belief-before-val">50</span>%)</label>
+                        <input type="range" id="diary-belief-before" min="0" max="100" value="50">
+                    </div>
+
+                    <!-- Step 3 -->
+                    <div class="wizard-step hidden" data-step="3">
+                        <label>What did you feel?</label>
+                        <input type="text" id="diary-emotion" placeholder="e.g. Anxious, Sad, Frustrated">
+
+                        <label class="slider-label">Intensity (<span id="intensity-val">50</span>%)</label>
+                        <input type="range" id="diary-intensity" min="0" max="100" value="50">
+                    </div>
+
+                    <!-- Step 4 -->
+                    <div class="wizard-step hidden" data-step="4">
+                        <label>Evidence that supports this thought</label>
+                        <textarea id="diary-evidence-for" placeholder="Objective facts confirming the thought..."
+                            rows="4"></textarea>
+                    </div>
+
+                    <!-- Step 5 -->
+                    <div class="wizard-step hidden" data-step="5">
+                        <label>Evidence against this thought</label>
+                        <textarea id="diary-evidence-against" placeholder="Facts that contradict the thought..."
+                            rows="4"></textarea>
+                    </div>
+
+                    <!-- Step 6 -->
+                    <div class="wizard-step hidden" data-step="6">
+                        <label>A more balanced perspective</label>
+                        <textarea id="diary-reframed" placeholder="Synthesize the evidence into a realistic view..."
+                            rows="3"></textarea>
+
+                        <label class="slider-label">Revised Belief (<span id="belief-after-val">50</span>%)</label>
+                        <input type="range" id="diary-belief-after" min="0" max="100" value="50">
+
+                        <label>Tags</label>
+                        <div class="tags-input-wrap">
+                            <div class="tags-container" id="diary-tags-container"></div>
+                            <input type="text" id="diary-tag-input" placeholder="Add tag (Press Enter or comma)">
+                        </div>
+                    </div>
+
+                    <div class="wizard-actions">
+                        <button type="button" id="diary-btn-back" class="nav-btn secondary hidden">← Back</button>
+                        <button type="button" id="diary-btn-next" class="submit-btn nav-btn primary">Next →</button>
+                    </div>
+                </form>
+
+                <div class="wellness-disclaimer">
+                    <p>Cognitive Canvas is a self-reflection wellness tool. It is not a substitute for professional
+                        mental health support.</p>
+                    <a href="https://findahelpline.com" target="_blank">findahelpline.com</a>
+                </div>
+            </div>
+        </aside>
+
+    </div> <!-- /app-layout -->
+
+
+    <!-- HITL VERIFICATION MODAL -->
+    <div id="hitl-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+            <button class="modal-close" id="hitl-close">×</button>
+            <div class="modal-header">
+                <h2>Review AI-Proposed Links</h2>
+                <p>Choose which connections to keep. You have the final say.</p>
+            </div>
+
+            <div class="modal-body">
+                <div class="classification-badge" id="hitl-classification">
+                    <!-- e.g. "Catastrophizing | Negative Distress | CD: 12%" -->
+                </div>
+
+                <div id="rumination-banner" class="rumination-banner hidden">
+                    <h3>⚠️ We noticed a pattern</h3>
+                    <p>You have logged several highly similar thoughts recently. This can be a sign of rumination, which
+                        is completely normal. Take a deep breath.</p>
+                    <textarea id="rumination-prompt" placeholder="Optional: What might help break this cycle right now?"
+                        rows="2"></textarea>
+                </div>
+
+                <h3 class="section-title">Proposed Connections (<span id="hitl-link-count">0</span>)</h3>
+
+                <div id="hitl-links-list" class="links-list">
+                    <!-- Link cards injected here -->
+                </div>
+
+                <div id="hitl-empty-state" class="empty-state hidden">
+                    <p>No similar entries found yet. This will be the first node in its cluster.</p>
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <div class="footer-disclaimer">Cognitive Canvas is a reflection tool, not a diagnostic proxy.</div>
+                <div class="footer-actions">
+                    <button id="hitl-save-none" class="btn-ghost">Save without links</button>
+                    <button id="hitl-save-confirm" class="submit-btn">Confirm & Save →</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- NODE DETAIL SLIDE-OUT PANEL -->
+    <div id="node-detail" class="slide-panel">
+        <button class="panel-close" id="detail-close">×</button>
+        <div class="detail-header">
+            <div class="entry-type-label" id="detail-type-label">○ Freeform</div>
+            <h2 id="detail-title" class="detail-title">Thought Title Example</h2>
+            <div class="detail-meta">
+                <span id="detail-date">Oct 12, 2026</span>
+                <span id="detail-drift-badge" class="badge">None</span>
+                <span id="detail-wellness-badge" class="badge">Neutral</span>
+            </div>
+        </div>
+
+        <div class="detail-body overflow-scroll">
+
+            <!-- Dynamic Content Injected Here -->
+            <div id="detail-content-area"></div>
+
+            <div class="detail-tags" id="detail-tags-area"></div>
+
+            <div class="connected-entries-section">
+                <h3>Connected Entries</h3>
+                <div class="connected-list" id="detail-connections-list">
+                    <!-- Connections injected here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <script src="script.js"></script>
+</body>
+
+</html>
