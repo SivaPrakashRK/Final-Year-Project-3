@@ -28,38 +28,50 @@
             <div class="logo-mark">
                 <span>Cognitive Canvas</span>
             </div>
+        </header>
 
-            <div class="search-container">
-                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <!-- FLOATING COMMAND CENTER -->
+        <div class="command-center" id="command-center">
+            <div class="cc-search-wrap">
+                <svg class="cc-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="11" cy="11" r="8"></circle>
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
-                <input type="text" id="search-input" placeholder="Search entries, tags, or themes…">
+                <input type="text" id="search-input" placeholder="Search memories… (themes, tags, emotions)">
             </div>
-
-            <div class="filter-controls">
-                <span class="filter-label">Wires:</span>
-                <button class="filter-chip active" data-type="semantic">
-                    <span class="dot dot-semantic"></span> Semantic
-                </button>
-                <button class="filter-chip active" data-type="compensatory">
-                    <span class="dot dot-compensatory"></span> Compensatory
-                </button>
-                <button class="filter-chip active" data-type="contextual">
-                    <span class="dot dot-contextual"></span> Contextual
-                </button>
-            </div>
-        </header>
+        </div>
 
         <!-- ROW 2 LEFT: GRAPH CANVAS -->
         <main class="graph-panel">
+            <div class="top-right-overlay">
+                <div class="cc-toggles-vertical">
+                    <button class="filter-chip" data-type="chronological">
+                        <span class="dot dot-chronological"></span> Chronological <span class="link-count"
+                            id="count-chronological">(0)</span>
+                    </button>
+                    <button class="filter-chip" data-type="semantic">
+                        <span class="dot dot-semantic"></span> Semantic Flashbacks <span class="link-count"
+                            id="count-semantic">(0)</span>
+                    </button>
+                    <button class="filter-chip" data-type="compensatory">
+                        <span class="dot dot-compensatory"></span> Pendulum Swings <span class="link-count"
+                            id="count-compensatory">(0)</span>
+                    </button>
+                    <button class="filter-chip" data-type="contextual">
+                        <span class="dot dot-contextual"></span> Shared Context <span class="link-count"
+                            id="count-contextual">(0)</span>
+                    </button>
+                </div>
+            </div>
             <svg id="graph-svg"></svg>
             <div class="graph-legend">
-                <div class="legend-item"><span class="legend-line line-chrono"></span> Chronological</div>
+                <div class="legend-title">MEMORY WIRES</div>
+                <div class="legend-item"><span class="legend-line line-chronological"></span> Timeline</div>
                 <div class="legend-item"><span class="legend-line line-semantic"></span> Semantic</div>
-                <div class="legend-item"><span class="legend-line line-compensatory"></span> Compensatory</div>
-                <div class="legend-item"><span class="legend-line line-contextual"></span> Contextual</div>
-                <div class="legend-item"><span class="legend-dot shape-diary">◇</span> Thought Diary</div>
+                <div class="legend-item"><span class="legend-line line-compensatory"></span> Pendulum Swing</div>
+                <div class="legend-item"><span class="legend-line line-contextual"></span> Shared Context</div>
+                <div class="legend-item"><span class="legend-swatch swatch-freeform"></span> Freeform Node</div>
+                <div class="legend-item"><span class="legend-swatch swatch-diary"></span> Evidence & Reframe Diary</div>
             </div>
         </main>
 
@@ -69,7 +81,7 @@
 
                 <div class="mode-switcher">
                     <button class="mode-btn active" data-mode="freeform">Freeform</button>
-                    <button class="mode-btn" data-mode="diary">Thought Diary</button>
+                    <button class="mode-btn" data-mode="diary">Evidence & Reframe Diary</button>
                 </div>
 
                 <!-- FREEFORM FORM -->
@@ -90,7 +102,7 @@
                             class="arrow">→</span></button>
                 </form>
 
-                <!-- THOUGHT DIARY FORM (WIZARD) -->
+                <!-- EVIDENCE & REFRAME DIARY FORM -->
                 <form id="form-diary" class="entry-form hidden">
                     <div class="wizard-progress">
                         <div class="step-label" id="diary-step-label">Step 1 of 6</div>
@@ -114,7 +126,7 @@
                     <!-- Step 2 -->
                     <div class="wizard-step hidden" data-step="2">
                         <label>What was your first thought?</label>
-                        <textarea id="diary-thought" placeholder="The automatic thought that popped into your head..."
+                        <textarea id="diary-thought" placeholder="The first thought that popped into your head..."
                             rows="3"></textarea>
 
                         <label class="slider-label">How strongly do you believe this? (<span
@@ -194,8 +206,8 @@
 
                 <div id="rumination-banner" class="rumination-banner hidden">
                     <h3>⚠️ We noticed a pattern</h3>
-                    <p>You have logged several highly similar thoughts recently. This can be a sign of rumination, which
-                        is completely normal. Take a deep breath.</p>
+                    <p>We noticed a repeating pattern in your recent entries. This is completely normal — our minds
+                        often revisit things that matter to us.</p>
                     <textarea id="rumination-prompt" placeholder="Optional: What might help break this cycle right now?"
                         rows="2"></textarea>
                 </div>
@@ -212,7 +224,9 @@
             </div>
 
             <div class="modal-footer">
-                <div class="footer-disclaimer">Cognitive Canvas is a reflection tool, not a diagnostic proxy.</div>
+                <div class="footer-disclaimer">Cognitive Canvas is a self-reflection wellness tool. It is not a
+                    substitute for professional mental health support. <a href="https://findahelpline.com"
+                        target="_blank">findahelpline.com</a></div>
                 <div class="footer-actions">
                     <button id="hitl-save-none" class="btn-ghost">Save without links</button>
                     <button id="hitl-save-confirm" class="submit-btn">Confirm & Save →</button>
@@ -222,19 +236,30 @@
     </div>
 
     <!-- NODE DETAIL SLIDE-OUT PANEL -->
-    <div id="node-detail" class="slide-panel">
-        <button class="panel-close" id="detail-close">×</button>
-        <div class="detail-header">
-            <div class="entry-type-label" id="detail-type-label">○ Freeform</div>
-            <h2 id="detail-title" class="detail-title">Thought Title Example</h2>
-            <div class="detail-meta">
-                <span id="detail-date">Oct 12, 2026</span>
-                <span id="detail-drift-badge" class="badge">None</span>
-                <span id="detail-wellness-badge" class="badge">Neutral</span>
+    <div id="node-detail" class="slide-panel notion-panel">
+        <button class="panel-close notion-close" id="detail-close">×</button>
+        <div class="detail-header notion-header">
+            <div class="entry-type-label notion-icon" id="detail-type-label">📃 Freeform</div>
+            <h2 id="detail-title" class="detail-title notion-title">Thought Title Example</h2>
+
+            <div class="notion-properties">
+                <div class="notion-prop-row">
+                    <div class="notion-prop-label"><span class="prop-icon">🕒</span> Date</div>
+                    <div class="notion-prop-value" id="detail-date">Oct 12, 2026</div>
+                </div>
+                <div class="notion-prop-row">
+                    <div class="notion-prop-label"><span class="prop-icon">🧠</span> Cognitive Drift</div>
+                    <div class="notion-prop-value"><span id="detail-drift-badge" class="notion-badge">None</span></div>
+                </div>
+                <div class="notion-prop-row">
+                    <div class="notion-prop-label"><span class="prop-icon">🌿</span> Wellness state</div>
+                    <div class="notion-prop-value"><span id="detail-wellness-badge" class="notion-badge">Neutral</span>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <div class="detail-body overflow-scroll">
+        <div class="detail-body overflow-scroll notion-body">
 
             <!-- Dynamic Content Injected Here -->
             <div id="detail-content-area"></div>

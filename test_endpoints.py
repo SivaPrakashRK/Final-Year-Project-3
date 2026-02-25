@@ -16,7 +16,7 @@ try:
         "context_tags": ["work", "stress"]
     }
     
-    res = requests.post("http://localhost:8000/analyze_thought", json=payload)
+    res = requests.post("http://localhost:8001/analyze_thought", json=payload)
     print("STATUS", res.status_code)
     data = res.json()
     print(json.dumps(data, indent=2))
@@ -30,12 +30,12 @@ try:
         
     save_payload["approved_links"] = approved_links
     
-    res2 = requests.post("http://localhost:8000/save_thought", json=save_payload)
+    res2 = requests.post("http://localhost:8001/save_thought", json=save_payload)
     print("STATUS", res2.status_code)
     print(json.dumps(res2.json(), indent=2))
     
     print("\n--- Testing GET /get_graph_data ---")
-    res3 = requests.get("http://localhost:8000/get_graph_data")
+    res3 = requests.get("http://localhost:8001/get_graph_data")
     print("STATUS", res3.status_code)
     d = res3.json()
     print("Nodes:", len(d.get("nodes", [])))
@@ -44,7 +44,7 @@ try:
         print("Sample link:", d["links"][-1])
         
     print("\n--- Testing GET /drift/weekly ---")
-    res4 = requests.get("http://localhost:8000/drift/weekly")
+    res4 = requests.get("http://localhost:8001/drift/weekly")
     print("STATUS", res4.status_code)
     print(json.dumps(res4.json(), indent=2))
     

@@ -1,44 +1,49 @@
 # Cognitive Drift Detection System (Cognitive Canvas)
 
-A local-first, privacy-centric web application for cognitive journaling, emotion tracking, and CBT-influenced reflection. The system uses local NLP models to classify cognitive distortions, detect rumination patterns, and build a semantic, force-directed graph of a user's thought history.
+A local-first, privacy-centric web application for cognitive journaling, emotion tracking, and CBT-influenced reflection. The system uses local NLP models to classify cognitive patterns, detect rumination, and build a semantic, force-directed graph of a user's thought history.
+
+**Disclaimer:** Cognitive Canvas is a self-awareness tool, not a clinical diagnostic service.
 
 ## Architecture
 
 *   **Backend:** FastAPI (Python), SQLite3, FAISS (Vector Database)
-*   **NLP & ML:** Hugging Face `sentence-transformers` (`BAAI/bge-large-en-v1.5`) & `transformers` pipeline (`facebook/bart-large-mnli`)
-*   **Frontend:** Vanilla HTML/CSS/JS, D3.js (Graph Visualization), Chart.js (Analytics)
+*   **NLP & ML:** Hugging Face `sentence-transformers` (`BAAI/bge-large-en-v1.5`), `transformers` pipeline (`facebook/bart-large-mnli` for cognitive drift, `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` for wellness categorization)
+*   **Frontend:** Vanilla JS, HTML, CSS Grid (4-panel layout), D3.js v7 (Narrative Timeline Visualization)
 
 ## Core Features
 
-### 1. Zero-Shot Cognitive Drift Detection
-When a user logs a freeform thought, the backend runs a zero-shot classification pipeline (`facebook/bart-large-mnli`) against common CBT cognitive distortions (e.g., Catastrophizing, All-or-nothing thinking, Mind reading). This flags "cognitive drift" automatically without requiring a clinical dataset.
+### 1. Human-in-the-Loop (HITL) Journaling Flow
+The system splits journaling into a two-step process:
+1. **Analysis (`/analyze_thought`):** Computes embeddings, runs zero-shot models, sets adaptive thresholds, and proposes potential graph links.
+2. **Review & Save (`/save_thought`):** Users review AI-proposed links via a modal interface. Only approved links and auto-verified chronological links are committed to the graph.
 
-### 2. Semantic Graphing (D3.js)
-Thoughts are embedded into high-dimensional vectors (using `bge-large-en-v1.5`) and stored in a FAISS index. The system maps relationships between thoughts to render a force-directed graph with three distinct link types:
-*   **Context Links:** Thoughts logged within 1 hour of each other that share at least 2 context tags. (Blue/Teal)
-*   **Semantic Links:** Thoughts with a high mathematical cosine similarity threshold (`>= 0.78`). (Amber)
-*   **Compensatory Links:** Highlights emotional whiplash. Connects thoughts with flipped emotional polarities (e.g., highly negative to highly positive) occurring within a 7-day window with strong semantic similarity (`>= 0.70`). (Red/Violet)
+### 2. Zero-Shot Cognitive Drift Detection
+When a user logs a freeform thought, the backend runs a zero-shot classification pipeline against common cognitive distortions (e.g., Catastrophizing, All-or-nothing thinking). This flags "cognitive drift" automatically.
 
-### 3. Rumination Guard
-The system constantly monitors for repetitive, entrenched thinking. If a new thought mathematically matches (`cosine_sim >= 0.85`) 3 or more previous thoughts within the last 24 hours, the backend flags it as "rumination". The frontend will gently interrupt the user with a wellbeing modal, suggesting they step away or break the cycle if they are dwelling.
+### 3. Semantic Narrative Timeline (D3.js)
+Thoughts are embedded into high-dimensional vectors and stored in a FAISS index. The UI renders a structured "Narrative Timeline" using a hybrid organic physics engine. Nodes are strictly locked to a chronological X-Axis to prevent "hairball" clumping, while memory connections sweep over the timeline as beautiful SVG Bezier curves. There are three distinct, user-toggleable AI link layers:
+*   **Contextual Links:** Thoughts that share at least 2 context tags. (Purple)
+*   **Semantic Links:** Thoughts sharing high cosine similarity, utilizing an adaptive user-specific threshold (`mu + sigma`). (Cyan)
+*   **Compensatory Links:** Connects thoughts with flipped wellness polarities (e.g., negative distress to positive growth) occurring within a 7-day window with semantic similarity `>= 0.55`. (Amber)
 
-### 4. CBT Thought Diary Wizard
+### 4. Intelligent Intersection Search
+The floating Command Center allows users to text-search their memories. The interface dynamically dims non-matching nodes. Crucially, if a memory layer is toggled on, connecting arcs are *only* drawn if **both** the source and target nodes match the search query, instantly cutting through visual noise.
+
+### 5. Rumination Guard
+The system monitors for repetitive, entrenched thinking. It checks the user's latest embedding against a historical mean and flags the entry if it correlates highly and the DeBERTa model detects "negative distress". If this pattern loops, the backend flags it as "rumination" and the frontend interrupts the user with a wellbeing modal containing cognitive defusion prompts.
+
+### 6. CBT Thought Diary Wizard & Notion Modals
 A structured, multi-step entry mode mirroring a Cognitive Behavioral Therapy (CBT) thought record:
 *   **Steps:** Situation -> First Thought (Belief %) -> Emotion (Intensity %) -> Evidence For -> Evidence Against -> Reframed Thought (Revised Belief %).
 *   **Belief Shift:** Calculates the mathematical shift in belief before and after the exercise.
-*   **Visualization:** Represented on the D3 graph as explicitly scaled **Diamond** nodes (scaling directly with the positive `belief_shift`), distinct from standard freeform circles. Negative shifts are highlighted with red-amber borders.
-
-### 5. Trend Analytics & Reporting
-*   **Weekly Drift Analysis:** Calculates a weekly "cognitive drift score" mathematically driven by the distance of weekly thought embeddings against the user's all-time structural mean. Visualized via a Chart.js bar graph.
-*   **Markdown Export:** Generates a downloadable `.md` file detailing all historical entries, timestamps, identified cognitive drifts, and summary statistics.
+*   **Visualization:** Clicking any standard date-pill node will slide out a gorgeous Notion-style metadata panel showcasing the entry breakdown, AI correlations, and detected cognitive drift.
 
 ## API Endpoints (`app.py`)
 
-*   `POST /log_thought`: Ingests freeform entries. Detects emotion, flags drift, builds vectors, finds FAISS semantic neighbors, generates graph links, and evaluates rumination guard thresholds.
-*   `POST /log_thought_diary`: Ingests structured 6-step CBT diary entries. Computes `belief_shift` alongside standard drift and graph processing.
-*   `GET /get_graph_data`: Returns the full topology (`nodes` and `links`) formatted for D3.js rendering. Includes strict data reshaping (e.g., mapping `automatic_thought` to `first_thought` for clinical distancing).
-*   `GET /drift/weekly`: Computes week-over-week temporal embedding variances for the Chart.js visualizer.
-*   `GET /export_report`: Downloads the user's entire history as a formatted Markdown timeline.
+*   `POST /analyze_thought`: Analyzes entries and returns proposed links and classifications for review.
+*   `POST /save_thought`: Commits the verified thought to the database alongside approved links.
+*   `GET /get_graph_data`: Returns the full topology (`nodes` and `links`) formatted for D3.js rendering. Includes strict data reshaping.
+*   `GET /drift/weekly`: Computes week-over-week temporal embedding variances for analytics.
 
 ## Running Locally
 
@@ -50,19 +55,18 @@ A structured, multi-step entry mode mirroring a Cognitive Behavioral Therapy (CB
     The application defaults Hugging Face caching to `D:/huggingface` to prevent `C:/` drive overflow. Ensure the `D:/` drive exists or modify `app.py` environment variables if running on a different machine.
 3.  **Start the Server:**
     ```bash
-    python app.py
+    uvicorn app:app --reload --port 8000
     ```
-    *(Alternatively: `uvicorn app:app --host 0.0.0.0 --port 8000 --reload`)*
 4.  **Client:**
-    Open `index.html` in a modern web browser. No frontend build step or package manager is required.
+    Open `index.html` via a local web server (e.g. `python -m http.server 8080`) in a modern web browser.
 
 ## Data Schema (`drift_v2.db`)
 
 **`drift_nodes`**
 *   `id`, `user_id`, `timestamp`, `entry_type` ("free_form" or "thought_diary")
 *   `situation`, `automatic_thought` / `first_thought`, `emotion`, `context_tags`
-*   `cognitive_drift`, `vector_embedding`, `rumination_flag_count`
+*   `cognitive_drift`, `vector_embedding`, `rumination_flag_count`, `wellness_label`, `similarity_score`
 *   *(Thought Diary fields)*: `thought_belief_before`, `emotion_intensity`, `evidence_for`, `evidence_against`, `reframed_thought`, `thought_belief_after`, `belief_shift`
 
 **`drift_links`**
-*   `id`, `source_id`, `target_id`, `link_type`, `similarity_score`, `details`
+*   `id`, `source_id`, `target_id`, `link_type`, `details`, `verified`

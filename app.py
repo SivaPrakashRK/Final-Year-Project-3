@@ -14,12 +14,13 @@ import faiss
 import json
 import logging
 import sqlite3
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -42,7 +43,43 @@ EMBED_PREFIX   = "Represent this sentence for retrieval: "
 
 # Graph-linking thresholds (calibrated)
 CONTEXT_LINK_MIN_TAGS   = 2      # shared tags required for a Context link
-SEMANTIC_LINK_THRESHOLD = 0.78   # cosine sim threshold for a Semantic link
+
+def blob_to_vec(blob):
+    if isinstance(blob, str):
+        return json.loads(blob)
+    return blob
+
+def cosine_similarity(v1, v2):
+    vec1 = np.array(v1, dtype=np.float32)
+    vec2 = np.array(v2, dtype=np.float32)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    if norm1 > 0 and norm2 > 0:
+        return float(np.dot(vec1, vec2) / (norm1 * norm2))
+    return 0.0
+
+def compute_adaptive_threshold(conn):
+    rows = conn.execute(
+        "SELECT vector_embedding FROM drift_nodes "
+        "WHERE vector_embedding IS NOT NULL"
+    ).fetchall()
+    if len(rows) < 3:
+        return 0.75  # fallback for sparse database
+    
+    vecs = [blob_to_vec(r["vector_embedding"]) 
+            for r in rows]
+    sample = vecs[:50]
+    similarities = []
+    for i in range(len(sample)):
+        for j in range(i + 1, len(sample)):
+            similarities.append(
+                cosine_similarity(sample[i], sample[j])
+            )
+    if not similarities:
+        return 0.75
+    mu    = np.mean(similarities)
+    sigma = np.std(similarities)
+    return float(mu + sigma)
 
 # Rumination Guard parameters
 RUMINATION_SIM_THRESHOLD = 0.85  # minimum cosine sim to count as a rumination match
@@ -57,38 +94,24 @@ id_mapping: dict[int, int] = {}                      # FAISS sequential index �
 # ── Model (loaded once at startup) ───────────────────────────────────────────
 _model: SentenceTransformer | None = None
 
-# ── Zero-shot drift classifier ───────────────────────────────────────────
-log.info("Loading zero-shot classifier: facebook/bart-large-mnli …")
-drift_classifier = hf_pipeline(
-    "zero-shot-classification",
-    model="facebook/bart-large-mnli",
-)
-log.info("Drift classifier ready.")
-
-log.info("Loading deberta-v3-base-zeroshot model for wellness detection…")
-deberta_classifier = hf_pipeline(
+# ── Zero-shot classifier ──────────────────────────────────────────────
+log.info("Loading deberta-v3-base-zeroshot model for classification…")
+classifier = hf_pipeline(
     "zero-shot-classification",
     model="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
 )
-log.info("Wellness classifier ready.")
+log.info("Classifier ready.")
 
-# Plain-English candidate labels the model reasons over
-_CANDIDATE_LABELS = [
-    "blowing things out of proportion",
-    "all-or-nothing thinking",
-    "taking it too personally",
-    "predicting the worst without evidence",
-    "healthy rational thought",
+DRIFT_LABELS = [
+    "anxiety", "motivation", "relationships", "work",
+    "identity", "creativity", "health", "grief", 
+    "joy", "uncertainty"
 ]
 
-# Map model output → drift label stored in DB
-_LABEL_TO_DRIFT: dict[str, str] = {
-    "blowing things out of proportion":    "Outcome Magnification",
-    "all-or-nothing thinking":             "Binary Framing",
-    "taking it too personally":            "Identity Fusion",
-    "predicting the worst without evidence": "Future Projection Bias",
-    "healthy rational thought":            "None",
-}
+WELLNESS_LABELS = [
+    "negative distress", "neutral reflection", "positive growth"
+]
+
 _CONFIDENCE_THRESHOLD = 0.60
 
 
@@ -136,11 +159,30 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS rumination_flags (
-                user_id INTEGER PRIMARY KEY,
-                flag_count INTEGER DEFAULT 0,
+                user_id      TEXT PRIMARY KEY DEFAULT 'local',
+                flag_count   INTEGER DEFAULT 0,
                 last_updated TEXT
             );
         """)
+        
+        try:
+            conn.execute("INSERT OR IGNORE INTO rumination_flags (user_id, flag_count) VALUES ('local', 0)")
+        except sqlite3.IntegrityError:
+            # Catch datatype mismatch if user_id was previously created as INTEGER
+            log.info("Migrating rumination_flags to fix user_id datatype...")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS rumination_flags_new (
+                    user_id      TEXT PRIMARY KEY DEFAULT 'local',
+                    flag_count   INTEGER DEFAULT 0,
+                    last_updated TEXT
+                );
+                INSERT OR IGNORE INTO rumination_flags_new (user_id, flag_count, last_updated)
+                SELECT CAST(user_id AS TEXT), flag_count, last_updated FROM rumination_flags;
+                DROP TABLE rumination_flags;
+                ALTER TABLE rumination_flags_new RENAME TO rumination_flags;
+                
+                INSERT OR IGNORE INTO rumination_flags (user_id, flag_count) VALUES ('local', 0);
+            """)
         # Migration: add details column to existing databases that predate this column
         try:
             conn.execute("ALTER TABLE drift_links ADD COLUMN details TEXT")
@@ -250,10 +292,12 @@ app.add_middleware(
 # ── Pydantic schema ───────────────────────────────────────────────────────────
 class EntryPayload(BaseModel):
     user_id:                int       = 1
-    situation:              str       = Field(..., min_length=1)
+    situation:              str       = "Freeform Entry"
     automatic_thought:      str       = Field(..., min_length=1)
     context_tags:           list[str] = Field(default_factory=list)
     entry_type:             str       = "free_form"
+    timestamp:              str | None = None
+
     
     # Optional fields for thought diary
     thought_belief_before:  int | None = None
@@ -308,7 +352,7 @@ def classify_drift(thought: str) -> str:
     corresponding drift term, or 'None' if confidence is too low.
     """
     try:
-        result    = drift_classifier(thought, _CANDIDATE_LABELS)
+        result    = classifier(thought, DRIFT_LABELS)
         top_label = result["labels"][0]
         top_score = result["scores"][0]
 
@@ -319,7 +363,7 @@ def classify_drift(thought: str) -> str:
         if top_score < _CONFIDENCE_THRESHOLD:
             return "None"
 
-        return _LABEL_TO_DRIFT.get(top_label, "None")
+        return top_label.title()
 
     except Exception as exc:  # noqa: BLE001
         log.error("Drift classifier failed: %s", exc)
@@ -327,65 +371,63 @@ def classify_drift(thought: str) -> str:
 
 
 # Wellness pattern detection only. Not a diagnostic tool.
-def check_rumination(user_id: int, current_embedding: list[float], current_text: str, db: sqlite3.Connection) -> dict:
-    """Detects reflection loops purely for wellness insights (non-diagnostic)."""
-    cursor = db.cursor()
+def check_rumination(conn, current_vec, current_text):
+    N, T_SIM, P_NEG, K = 5, 0.88, 0.70, 3
     
-    # Step 1: Fetch the last 5 entry embeddings for this user from sqlite-vec
-    rows = cursor.execute(
-        "SELECT vector_embedding FROM drift_nodes WHERE user_id = ? ORDER BY id DESC LIMIT 5",
-        (user_id,)
-    ).fetchall()
+    recent = conn.execute("""
+        SELECT vector_embedding FROM drift_nodes
+        WHERE vector_embedding IS NOT NULL
+        ORDER BY id DESC LIMIT ?
+    """, (N,)).fetchall()
     
-    if len(rows) < 5:
-        return {"rumination_detected": False, "flag_count": 0}
-        
-    embeddings_list = []
-    for r in rows:
-        embeddings_list.append(json.loads(r["vector_embedding"]))
-        
-    embeddings_np = np.array(embeddings_list, dtype=np.float32)
-    current_emb_np = np.array(current_embedding, dtype=np.float32)
+    if len(recent) < N:
+        return {"rumination_detected": False, 
+                "flag_count": 0}
     
-    # Step 2: Compute the mean of those 5 embeddings using numpy
-    mean_vec = np.mean(embeddings_np, axis=0)
+    recent_vecs = [
+        blob_to_vec(r["vector_embedding"]) 
+        for r in recent
+    ]
+    mean_vec    = np.mean(recent_vecs, axis=0)
+    similarity  = cosine_similarity(current_vec, 
+                                    mean_vec)
     
-    # Step 3: Compute cosine similarity between current_embedding and that mean vector using numpy
-    dot_product = np.dot(current_emb_np, mean_vec)
-    norm_curr = np.linalg.norm(current_emb_np)
-    norm_mean = np.linalg.norm(mean_vec)
-    cosine_sim = dot_product / (norm_curr * norm_mean) if (norm_curr > 0 and norm_mean > 0) else 0.0
+    result    = classifier(current_text, 
+                           WELLNESS_LABELS)
+    label_map = dict(zip(result["labels"], 
+                         result["scores"]))
+    p_neg     = label_map.get("negative distress", 0.0)
     
-    # Step 4: Run zero-shot classification on current_text
-    labels = ["negative distress", "neutral reflection", "positive growth"]
-    res = deberta_classifier(current_text, labels)
+    flag_row = conn.execute(
+        "SELECT flag_count FROM rumination_flags "
+        "WHERE user_id = 'local'"
+    ).fetchone()
+    flag_count = flag_row["flag_count"] if flag_row else 0
     
-    # Step 5: Extract the probability score for "negative distress"
-    p_negative = 0.0
-    for label, score in zip(res["labels"], res["scores"]):
-        if label == "negative distress":
-            p_negative = score
-            break
-            
-    # Step 6 & 7: Increment or reset rumination_flag_count
-    now_str = datetime.now(timezone.utc).isoformat()
-    flag_row = cursor.execute("SELECT flag_count FROM rumination_flags WHERE user_id = ?", (user_id,)).fetchone()
-    current_count = flag_row["flag_count"] if flag_row else 0
-    
-    if cosine_sim > 0.88 and p_negative > 0.70:
-        new_count = current_count + 1
+    if similarity > T_SIM and p_neg > P_NEG:
+        flag_count += 1
     else:
-        new_count = 0
-        
-    cursor.execute("""
-        INSERT OR REPLACE INTO rumination_flags (user_id, flag_count, last_updated)
-        VALUES (?, ?, ?)
-    """, (user_id, new_count, now_str))
-    db.commit()
+        flag_count = 0
     
-    # Step 8 & 9: Return appropriate flag logic
-    reflection_loop = new_count >= 3
-    return {"rumination_detected": reflection_loop, "flag_count": safe_int(new_count), "cosine_sim": safe_float(cosine_sim)}
+    conn.execute(
+        "UPDATE rumination_flags SET flag_count = ? "
+        "WHERE user_id = 'local'", (flag_count,)
+    )
+    conn.commit()
+    
+    rumination_detected = flag_count >= K
+    if rumination_detected:
+        conn.execute(
+            "UPDATE rumination_flags SET flag_count = 0 "
+            "WHERE user_id = 'local'"
+        )
+        conn.commit()
+    
+    return {
+        "rumination_detected": rumination_detected,
+        "flag_count":          flag_count,
+        "similarity_to_mean":  round(similarity, 4),
+    }
 
 # ── Graph logic & Rumination Guard ───────────────────────────────────────────
 def process_graph_and_guard(
@@ -418,6 +460,8 @@ def process_graph_and_guard(
         now_dt = datetime.now(timezone.utc)
     rumination_cutoff = now_dt - timedelta(hours=RUMINATION_WINDOW_HOURS)
     rumination_count = 0
+    
+    threshold = compute_adaptive_threshold(conn)
 
     # ── 1. FAISS search — Semantic links + Rumination Guard ───────────────────
     if faiss_index.ntotal > 0:
@@ -435,7 +479,7 @@ def process_graph_and_guard(
                 continue
 
             # Semantic link
-            if sim > SEMANTIC_LINK_THRESHOLD:
+            if sim > threshold:
                 details = f"{int(sim * 100)}% Semantic Match"
                 links_to_insert.append((new_node_id, hist_id, "Semantic", details))
                 log.debug(
@@ -513,12 +557,93 @@ def process_graph_and_guard(
             new_node_id, rumination_count, RUMINATION_WINDOW_HOURS,
         )
     return rumination_detected
+    return rumination_detected
+
+# ── Transitive Reduction ──────────────────────────────────────────────────────
+class TransitiveReducer:
+    def __init__(self, entries: list[dict], links: list[dict]):
+        self.entries = {e['id']: e for e in entries}
+        self.links = links
+        self.adjacency = defaultdict(set)
+        self._build_adjacency()
+    
+    def _build_adjacency(self):
+        """Build adjacency list from chronological links only."""
+        chronological_links = [l for l in self.links if (l.get('link_type') or '').lower() == 'chronological']
+        for link in chronological_links:
+            self.adjacency[link['source_id']].add(link['target_id'])
+    
+    def _find_path(self, source_id: int, target_id: int, max_hops: int = 10) -> list[int]:
+        """Find if a path exists between source and target using BFS."""
+        if source_id == target_id:
+            return [source_id]
+        
+        queue = deque([(source_id, [source_id])])
+        visited = {source_id}
+        
+        while queue:
+            current, path = queue.popleft()
+            
+            if len(path) > max_hops:
+                continue
+            
+            for neighbor in self.adjacency[current]:
+                if neighbor == target_id:
+                    return path + [neighbor]
+                
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+        
+        return []
+    
+    def reduce(self, min_temporal_gap: int = 2) -> list[dict]:
+        """Apply transitive reduction to semantic links."""
+        chronological = [l for l in self.links if (l.get('link_type') or '').lower() == 'chronological']
+        contextual = [l for l in self.links if (l.get('link_type') or '').lower() == 'contextual']
+        semantic = [l for l in self.links if (l.get('link_type') or '').lower() == 'semantic']
+        compensatory = [l for l in self.links if (l.get('link_type') or '').lower() == 'compensatory']
+        
+        self.adjacency = defaultdict(set)
+        for link in chronological:
+            self.adjacency[link['source_id']].add(link['target_id'])
+        
+        reduced_semantic = []
+        
+        for link in semantic:
+            source_id = link['source_id']
+            target_id = link['target_id']
+            
+            source_entry = self.entries.get(source_id)
+            target_entry = self.entries.get(target_id)
+            
+            if not source_entry or not target_entry:
+                continue
+            
+            source_time = source_entry.get('timestamp')
+            target_time = target_entry.get('timestamp')
+            
+            try:
+                s_dt = datetime.fromisoformat(source_time)
+                t_dt = datetime.fromisoformat(target_time)
+                temporal_gap = abs((t_dt - s_dt).days)
+            except (ValueError, TypeError):
+                temporal_gap = 0
+            
+            if temporal_gap < min_temporal_gap:
+                path = self._find_path(source_id, target_id)
+                if path:
+                    continue
+            
+            reduced_semantic.append(link)
+        
+        return chronological + contextual + reduced_semantic + compensatory
 
 
 # ── POST /analyze_thought & /save_thought ───────────────────────────────────
 
 def _format_full_text(payload: EntryPayload) -> str:
-    if payload.entry_type == "thought_diary":
+    if payload.entry_type == "evidence_reframe_diary":
         return (
             f"Situation: {payload.situation}. "
             f"Thought: {payload.automatic_thought} (belief: {payload.thought_belief_before}%). "
@@ -530,8 +655,103 @@ def _format_full_text(payload: EntryPayload) -> str:
         )
     return payload.automatic_thought
 
+def find_semantic_chain_link(conn, current_vec, current_id, threshold):
+    """
+    Walks backwards through entry history.
+    Returns at most ONE link — the nearest 
+    semantically meaningful predecessor.
+    Ensures chain topology, not web topology.
+    """
+    rows = conn.execute("""
+        SELECT id, timestamp, automatic_thought,
+               situation, entry_type, context_tags,
+               vector_embedding, wellness_label
+        FROM drift_nodes
+        WHERE id < ?
+          AND vector_embedding IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 20
+    """, (current_id or 999999,)).fetchall()
+    
+    for row in rows:
+        vec = blob_to_vec(row["vector_embedding"])
+        sim = cosine_similarity(current_vec, vec)
+        
+        if sim >= threshold:
+            preview = (
+                row["automatic_thought"] or
+                row["situation"] or ""
+            )
+            return [{
+                "target_id":  row["id"],
+                "similarity": round(sim, 4),
+                "created_at": row["timestamp"],
+                "preview":    preview[:120],
+                "entry_type": row["entry_type"] or "free_form",
+                "tags": json.loads(
+                    row["context_tags"] or "[]"
+                ),
+                "link_type": "semantic",
+            }]
+    return []
+
+def find_contextual_chain_link(conn, tags, current_id):
+    if not tags:
+        return []
+    
+    rows = conn.execute("""
+        SELECT id, timestamp, automatic_thought,
+               situation, entry_type, context_tags
+        FROM drift_nodes
+        WHERE id < ?
+          AND context_tags IS NOT NULL
+          AND context_tags != ''
+          AND context_tags != '[]'
+        ORDER BY id DESC
+        LIMIT 50
+    """, (current_id or 999999,)).fetchall()
+
+    incoming = set(
+        t.strip().lower() for t in tags if t.strip()
+    )
+
+    for row in rows:
+        raw = row["context_tags"] or "[]"
+        try:
+            stored = json.loads(raw)
+            if not isinstance(stored, list):
+                stored = [str(stored)]
+        except (json.JSONDecodeError, ValueError):
+            stored = [
+                t.strip() for t in raw.split(",")
+            ]
+        
+        stored_norm = set(
+            t.strip().lower() for t in stored 
+            if t.strip()
+        )
+        shared = incoming & stored_norm
+        
+        if shared:
+            preview = (
+                row["automatic_thought"] or 
+                row["situation"] or ""
+            )
+            return [{
+                "target_id":  row["id"],
+                "similarity": 1.0,
+                "created_at": row["timestamp"],
+                "preview":    preview[:120],
+                "entry_type": row["entry_type"] or "free_form",
+                "tags":       list(stored_norm),
+                "link_type":  "contextual",
+                "shared_tag": list(shared)[0],
+            }]
+    return []
+
+
 @app.post("/analyze_thought")
-async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
+def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
     full_text = _format_full_text(payload)
     
     # Generate Embedding
@@ -543,8 +763,7 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
     # Classifications
     drift_label = classify_drift(payload.automatic_thought)
     
-    wellness_labels = ["negative distress", "neutral reflection", "positive growth"]
-    w_res = deberta_classifier(full_text, wellness_labels)
+    w_res = classifier(full_text, WELLNESS_LABELS)
     wellness_label = w_res["labels"][0]
     wellness_score = w_res["scores"][0]
     
@@ -559,7 +778,6 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
             (payload.user_id,)
         ).fetchall()
         
-        semantic_links = []
         compensatory_links = []
         contextual_links = []
         
@@ -591,7 +809,7 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
                 dot_p = np.dot(curr_np[0], all_time_mean)
                 cd_score = 1.0 - max(0.0, min(1.0, dot_p / norm_all))
             
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.fromisoformat(payload.timestamp).replace(tzinfo=timezone.utc) if payload.timestamp else datetime.now(timezone.utc)
             cutoff_7d = now_dt - timedelta(days=7)
             
             new_tags_set = {t.lower().strip() for t in payload.context_tags}
@@ -602,18 +820,6 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
                 preview = r["automatic_thought"][:120]
                 hist_tags = {t.lower().strip() for t in json.loads(r["context_tags"] or "[]")}
                 
-                # Semantic Candidates
-                if sim > adaptive_threshold:
-                    semantic_links.append({
-                        "target_id": hist_id,
-                        "similarity": round(sim, 4),
-                        "created_at": r["timestamp"],
-                        "preview": preview,
-                        "entry_type": r["entry_type"] or "free_form",
-                        "tags": list(hist_tags),
-                        "link_type": "semantic"
-                    })
-                    
                 # Compensatory Candidates
                 # opposite wellness label, same topic (shared tag), within 7 days, sim >= 0.55
                 # Negative vs Positive mapping
@@ -642,26 +848,19 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
                         "link_type": "compensatory"
                     })
                     
-                # Contextual Candidates (Context links)
-                if len(new_tags_set & hist_tags) >= CONTEXT_LINK_MIN_TAGS:
-                    if hist_id != new_node_id: # wait, new node is not in DB yet
-                        contextual_links.append({
-                            "target_id": hist_id,
-                            "similarity": round(sim, 4),
-                            "created_at": r["timestamp"],
-                            "preview": preview,
-                            "entry_type": r["entry_type"] or "free_form",
-                            "tags": list(hist_tags),
-                            "link_type": "contextual"
-                        })
-                    
         # Sort and limit candidates
-        semantic_links = sorted(semantic_links, key=lambda x: x["similarity"], reverse=True)[:8]
         compensatory_links = sorted(compensatory_links, key=lambda x: x["similarity"], reverse=True)[:3]
-        contextual_links = sorted(contextual_links, key=lambda x: x["similarity"], reverse=True)
+        
+        clean_tags = [t.strip().lower() for t in (payload.context_tags or []) if t.strip()]
+        contextual_links = find_contextual_chain_link(conn, clean_tags, None)
+
+        threshold = compute_adaptive_threshold(conn)
+        semantic_proposals = find_semantic_chain_link(
+            conn, vector, None, threshold
+        )
         
         # Rumination Guard check (do not trigger save, check only)
-        rumination_res = check_rumination(payload.user_id, vector, full_text, conn)
+        rumination_res = check_rumination(conn, vector, full_text)
         
     except sqlite3.Error as exc:
         log.error("DB error in analyze_thought: %s", exc)
@@ -683,41 +882,219 @@ async def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
             "flag_count": rumination_res["flag_count"]
         },
         "proposed_links": {
-            "semantic": semantic_links,
+            "semantic": semantic_proposals,
             "compensatory": compensatory_links,
             "contextual": contextual_links
         },
+        "reduction_applied": True,
+    }
+
+@app.post("/benchmark_analyze")
+def benchmark_analyze(payload: EntryPayload) -> dict[str, Any]:
+    """
+    Identical to /analyze_thought but wraps key processes in timers
+    and returns the timings in the response payload.
+    """
+    import time
+    
+    t_start = time.perf_counter()
+    full_text = _format_full_text(payload)
+    
+    # Generate Embedding
+    t_emb_start = time.perf_counter()
+    vector = vectorize(full_text)
+    t_emb_end = time.perf_counter()
+    
+    # Classifications
+    drift_label = classify_drift(payload.automatic_thought)
+    t_drift_end = time.perf_counter()
+    
+    w_res = classifier(full_text, WELLNESS_LABELS)
+    wellness_label = w_res["labels"][0]
+    wellness_score = w_res["scores"][0]
+    t_infer_end = time.perf_counter()
+    
+    conn = get_connection()
+    t_faiss_start = time.perf_counter()
+    try:
+        cursor = conn.cursor()
+        
+        rows = cursor.execute(
+            "SELECT id, vector_embedding, timestamp, situation, automatic_thought, context_tags, entry_type, wellness_label FROM drift_nodes WHERE user_id = ?",
+            (payload.user_id,)
+        ).fetchall()
+        
+        compensatory_links = []
+        contextual_links = []
+        adaptive_threshold = 0.75 
+        cd_score = 0.0
+        
+        if rows:
+            all_vecs = []
+            for r in rows:
+                v = json.loads(r["vector_embedding"])
+                all_vecs.append(v)
+                
+            all_np = np.array(all_vecs, dtype=np.float32)
+            curr_np = np.array([vector], dtype=np.float32)
+            
+            faiss.normalize_L2(all_np)
+            faiss.normalize_L2(curr_np)
+            
+            sims = np.dot(all_np, curr_np[0])
+            mu = float(np.mean(sims))
+            sigma = float(np.std(sims))
+            adaptive_threshold = max(0.50, min(0.95, mu + sigma))
+            
+            all_time_mean = np.mean(all_np, axis=0)
+            norm_all = np.linalg.norm(all_time_mean)
+            if norm_all > 0:
+                dot_p = np.dot(curr_np[0], all_time_mean)
+                cd_score = 1.0 - max(0.0, min(1.0, dot_p / norm_all))
+            
+            now_dt = datetime.fromisoformat(payload.timestamp).replace(tzinfo=timezone.utc) if payload.timestamp else datetime.now(timezone.utc)
+            cutoff_7d = now_dt - timedelta(days=7)
+            new_tags_set = {t.lower().strip() for t in payload.context_tags}
+            
+            for i, r in enumerate(rows):
+                sim = float(sims[i])
+                hist_id = r["id"]
+                preview = r["automatic_thought"][:120]
+                hist_tags = {t.lower().strip() for t in json.loads(r["context_tags"] or "[]")}
+                
+                hist_wellness = r["wellness_label"]
+                is_opposite = False
+                if wellness_label == "negative distress" and hist_wellness == "positive growth":
+                    is_opposite = True
+                elif wellness_label == "positive growth" and hist_wellness == "negative distress":
+                    is_opposite = True
+                    
+                has_shared_tag = len(new_tags_set & hist_tags) > 0
+                
+                try:
+                    hist_dt = datetime.fromisoformat(r["timestamp"]).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    hist_dt = datetime.min.replace(tzinfo=timezone.utc)
+                    
+                if is_opposite and has_shared_tag and (hist_dt >= cutoff_7d) and (sim >= 0.55):
+                    compensatory_links.append({
+                        "target_id": hist_id,
+                        "similarity": round(sim, 4),
+                        "created_at": r["timestamp"],
+                        "preview": preview,
+                        "entry_type": r["entry_type"] or "free_form",
+                        "tags": list(hist_tags),
+                        "link_type": "compensatory"
+                    })
+                    
+        compensatory_links = sorted(compensatory_links, key=lambda x: x["similarity"], reverse=True)[:3]
+        
+        clean_tags = [t.strip().lower() for t in (payload.context_tags or []) if t.strip()]
+        contextual_links = find_contextual_chain_link(conn, clean_tags, None)
+        
+        threshold = compute_adaptive_threshold(conn)
+        semantic_proposals = find_semantic_chain_link(
+            conn, vector, None, threshold
+        )
+        
+        rumination_res = check_rumination(conn, vector, full_text)
+        
+    except sqlite3.Error as exc:
+        log.error("DB error in benchmark_analyze: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+    finally:
+        conn.close()
+        
+    t_faiss_end = time.perf_counter()
+    
+    t_end_total = time.perf_counter()
+    
+    return {
+        "timings": {
+            "embedding_time_ms": (t_emb_end - t_emb_start) * 1000,
+            "drift_time_ms": (t_drift_end - t_emb_end) * 1000,
+            "wellness_time_ms": (t_infer_end - t_drift_end) * 1000,
+            "faiss_retrieval_time_ms": (t_faiss_end - t_faiss_start) * 1000,
+            "total_internal_time_ms": (t_end_total - t_start) * 1000
+        },
+        "classification": {
+            "drift_label": drift_label,
+            "drift_score": 1.0, 
+            "wellness_label": wellness_label,
+            "wellness_score": float(round(wellness_score, 4)),
+            "cognitive_drift": float(round(cd_score, 4))
+        },
+        "rumination": {
+            "rumination_detected": rumination_res["rumination_detected"],
+            "flag_count": rumination_res["flag_count"]
+        },
+        "proposed_links": {
+            "semantic": semantic_proposals,
+            "compensatory": compensatory_links,
+            "contextual": contextual_links
+        },
+        "reduction_applied": True,
         "adaptive_threshold": float(round(adaptive_threshold, 4))
     }
 
 
+def run_zero_shot_analysis(node_id: int, user_id: int, full_text: str, automatic_thought: str, vector: list[float], timestamp: str | None) -> None:
+    try:
+        # Zero-shot classifications
+        drift_label = classify_drift(automatic_thought)
+        
+        w_res = classifier(full_text, WELLNESS_LABELS)
+        wellness_label = w_res["labels"][0]
+        
+        # Connect to DB and update the node
+        conn = get_connection()
+        try:
+            # check_rumination logic needs db connection
+            rumination_res = check_rumination(conn, vector, full_text)
+            flag_count = safe_int(rumination_res["flag_count"])
+            cosine_sim = safe_float(rumination_res.get("similarity_to_mean", 0.0))
+            
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE drift_nodes
+                SET cognitive_drift = ?,
+                    wellness_label = ?,
+                    rumination_flag_count = ?,
+                    similarity_score = ?
+                WHERE id = ?
+            """, (drift_label, wellness_label, flag_count, cosine_sim, node_id))
+            conn.commit()
+            log.info("Background analysis complete for node %d.", node_id)
+        except Exception as inner_exc:
+            log.error("Database error in background task for node %d: %s", node_id, inner_exc)
+        finally:
+            conn.close()
+            
+    except Exception as exc:
+        log.error("Background task failed for node %d: %s", node_id, exc)
+
 @app.post("/save_thought")
-async def save_thought(payload: SaveEntryPayload) -> dict[str, Any]:
+def save_thought(payload: SaveEntryPayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
     full_text = _format_full_text(payload)
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = payload.timestamp if payload.timestamp else datetime.now(timezone.utc).isoformat()
     
-    # Recalculate
+    # Recalculate Fast Path (Synchronous)
     vector = vectorize(full_text)
-    drift_label = classify_drift(payload.automatic_thought)
-    
-    wellness_labels = ["negative distress", "neutral reflection", "positive growth"]
-    w_res = deberta_classifier(full_text, wellness_labels)
-    wellness_label = w_res["labels"][0]
     
     belief_shift = 0
     if payload.thought_belief_before is not None and payload.thought_belief_after is not None:
         belief_shift = payload.thought_belief_before - payload.thought_belief_after
 
+    raw_tags = payload.context_tags or []
+    clean_tags = json.dumps(
+        [t.strip().lower() for t in raw_tags if t.strip()]
+    )
+
     conn = get_connection()
     try:
         cursor = conn.cursor()
         
-        # Check rumination (modifies rumination_flags implicitly in check_rumination)
-        rumination_res = check_rumination(payload.user_id, vector, full_text, conn)
-        flag_count = safe_int(rumination_res["flag_count"])
-        cosine_sim = safe_float(rumination_res.get("cosine_sim", 0.0))
-        
-        # Insert node
+        # Insert node with pending values for heavy NLP tasks
         cursor.execute(
             """
             INSERT INTO drift_nodes
@@ -730,8 +1107,8 @@ async def save_thought(payload: SaveEntryPayload) -> dict[str, Any]:
                 timestamp,
                 payload.situation,
                 payload.automatic_thought,
-                drift_label,
-                json.dumps(payload.context_tags),
+                "Analyzing...",
+                clean_tags,
                 json.dumps(vector),
                 payload.entry_type,
                 payload.thought_belief_before,
@@ -742,9 +1119,9 @@ async def save_thought(payload: SaveEntryPayload) -> dict[str, Any]:
                 payload.reframed_thought,
                 payload.thought_belief_after,
                 belief_shift,
-                wellness_label,
-                flag_count,
-                cosine_sim
+                "Analyzing...",
+                0,
+                0.0
             ),
         )
         new_node_id = cursor.lastrowid
@@ -782,12 +1159,24 @@ async def save_thought(payload: SaveEntryPayload) -> dict[str, Any]:
     finally:
         conn.close()
         
+    # Enqueue Background Task for heavy Zero-Shot NLP and DB update
+    background_tasks.add_task(
+        run_zero_shot_analysis,
+        node_id=new_node_id,
+        user_id=payload.user_id,
+        full_text=full_text,
+        automatic_thought=payload.automatic_thought,
+        vector=vector,
+        timestamp=payload.timestamp
+    )
+        
     return {
-        "status": "saved",
+        "status": "success",
+        "message": "Thought logged. Analysis running in background.",
         "node_id": new_node_id,
         "rumination": {
-            "rumination_detected": rumination_res["rumination_detected"],
-            "flag_count": rumination_res["flag_count"]
+            "rumination_detected": False, # Placeholder fast-return
+            "flag_count": 0
         }
     }
 
@@ -805,7 +1194,7 @@ async def get_graph_data() -> dict[str, list[dict]]:
 
         cursor.execute(
             """
-            SELECT id, timestamp, situation, automatic_thought, cognitive_drift, context_tags, rumination_flag_count, similarity_score,
+            SELECT id, timestamp, situation, automatic_thought, cognitive_drift, context_tags, rumination_flag_count, similarity_score, wellness_label,
                    entry_type, thought_belief_before, emotion, emotion_intensity, evidence_for, evidence_against, reframed_thought, thought_belief_after, belief_shift
             FROM drift_nodes
             ORDER BY id ASC
@@ -815,32 +1204,27 @@ async def get_graph_data() -> dict[str, list[dict]]:
         for row in cursor.fetchall():
             nodes.append({
                 "id":               row["id"],
-                "timestamp":        row["timestamp"],
+                "date":        row["timestamp"],
                 "situation":        row["situation"],
-                "first_thought":    row["automatic_thought"],
+                "text":    row["automatic_thought"],
                 "cognitive_drift":  row["cognitive_drift"],
-                "context_tags":     json.loads(row["context_tags"] or "[]"),
-                "rumination_flag_count": safe_int(row["rumination_flag_count"]),
+                "wellness":         row["wellness_label"] or "neutral reflection",
+                "tags":     json.loads(row["context_tags"] or "[]"),
+                "rumination_flag": safe_int(row["rumination_flag_count"]),
                 "similarity_score": safe_float(row["similarity_score"]),
                 
                 # New fields for structured diaries
                 "entry_type":            row["entry_type"] if row["entry_type"] is not None else "free_form",
-                "thought_belief_before": row["thought_belief_before"],
-                "emotion":               row["emotion"],
-                "emotion_intensity":     row["emotion_intensity"],
-                "evidence_for":          row["evidence_for"],
-                "evidence_against":      row["evidence_against"],
-                "reframed_thought":      row["reframed_thought"],
-                "thought_belief_after":  row["thought_belief_after"],
-                "belief_shift":          row["belief_shift"],
-                
-                # Helpers consumed by D3 renderer
-                "label":            str(row["id"]),
-                "drift_type":       row["cognitive_drift"],
-                "event":            row["situation"],
-                "thought":          row["automatic_thought"], # we still feed this to the generic frontend render logic without mutating its expectations
-                "tags":             json.loads(row["context_tags"] or "[]"),
-                "tag_count":        len(json.loads(row["context_tags"] or "[]")),
+                "details": {
+                    "thought_belief_before": row["thought_belief_before"],
+                    "emotion":               row["emotion"],
+                    "emotion_intensity":     row["emotion_intensity"],
+                    "evidence_for":          row["evidence_for"],
+                    "evidence_against":      row["evidence_against"],
+                    "reframed_thought":      row["reframed_thought"],
+                    "thought_belief_after":  row["thought_belief_after"],
+                    "belief_shift":          row["belief_shift"],
+                }
             })
 
         cursor.execute(
@@ -1042,4 +1426,4 @@ async def export_report() -> PlainTextResponse:
 # ── Dev entry-point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=True)

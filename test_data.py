@@ -39,7 +39,7 @@ entries = [
     {"type": "/log_thought", "payload": {
         "timestamp": days_ago(26, 9), "situation": "Morning standup meeting.", "automatic_thought": "Everyone else sounds so smart, I have nothing good to report.", "context_tags": ["work", "social"]
     }},
-    {"type": "/log_thought_diary", "payload": {
+    {"type": "/log_evidence_reframe_diary", "payload": {
         "timestamp": days_ago(25, 18), "situation": "End of a tough week at work.", "automatic_thought": "I will never succeed in this industry.", "thought_belief_before": 80, 
         "emotion": "hopeless", "emotion_intensity": 75,
         "evidence_for": "I got negative feedback on my recent sprint.", "evidence_against": "I have successfully delivered 3 previous projects this year.",
@@ -72,7 +72,7 @@ entries = [
     }},
     
     # ── Various other scattered thoughts (Week 3) ──
-    {"type": "/log_thought_diary", "payload": {
+    {"type": "/log_evidence_reframe_diary", "payload": {
         "timestamp": days_ago(18, 20), "situation": "Friend finally replied and apologised they were busy.", "automatic_thought": "They are just lying to be polite.", "thought_belief_before": 60,
         "emotion": "anxious", "emotion_intensity": 70,
         "evidence_for": "They took hours to reply.", "evidence_against": "They specifically said they had a family emergency.",
@@ -96,7 +96,7 @@ entries = [
     {"type": "/log_thought", "payload": {
         "timestamp": days_ago(14, 10, 50), "situation": "Trying to memorize chapter 3.", "automatic_thought": "I can't retain any of this information.", "context_tags": ["study", "exam"]
     }},
-    {"type": "/log_thought_diary", "payload": {
+    {"type": "/log_evidence_reframe_diary", "payload": {
         "timestamp": days_ago(13, 11), "situation": "Feeling overwhelmed by the exam syllabus.", "automatic_thought": "I am guaranteed to fail.", "thought_belief_before": 90,
         "emotion": "overwhelmed", "emotion_intensity": 85,
         "evidence_for": "There are 400 pages left.", "evidence_against": "I passed my last exam by breaking it into chunks.",
@@ -115,7 +115,7 @@ entries = [
     {"type": "/log_thought", "payload": {
         "timestamp": days_ago(9, 14), "situation": "Forgot to send an email.", "automatic_thought": "My boss will definitely fire me for this.", "context_tags": ["work", "mistake"]
     }},
-    {"type": "/log_thought_diary", "payload": {
+    {"type": "/log_evidence_reframe_diary", "payload": {
         "timestamp": days_ago(8, 16), "situation": "Worrying about the forgotten email.", "automatic_thought": "This email mistake will ruin my whole career.", "thought_belief_before": 70,
         "emotion": "fear", "emotion_intensity": 60,
         "evidence_for": "It was for a client.", "evidence_against": "My boss just said 'no worries, send it now'.",
@@ -142,7 +142,7 @@ entries = [
     {"type": "/log_thought", "payload": {
         "timestamp": days_ago(2, 11), "situation": "Team meeting.", "automatic_thought": "I enjoy working with this team.", "context_tags": ["work", "team"]
     }},
-    {"type": "/log_thought_diary", "payload": {
+    {"type": "/log_evidence_reframe_diary", "payload": {
         "timestamp": days_ago(1, 14), "situation": "Criticism from a colleague.", "automatic_thought": "They think I am incompetent.", "thought_belief_before": 60,
         "emotion": "defensive", "emotion_intensity": 75,
         "evidence_for": "They pointed out a bug in my code.", "evidence_against": "They said the rest of the feature was excellent.",
