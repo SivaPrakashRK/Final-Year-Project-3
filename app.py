@@ -59,7 +59,7 @@ def cosine_similarity(v1, v2):
     return 0.0
 
 def normalize_l2(x: np.ndarray) -> None:
-    # In-place L2 normalization mimicking faiss.normalize_L2
+    # In-place L2 normalization for 2-D arrays (shape [N, D])
     norms = np.linalg.norm(x, axis=1, keepdims=True)
     norms[norms == 0] = 1 # prevent zero division
     x /= norms
@@ -92,10 +92,7 @@ RUMINATION_SIM_THRESHOLD = 0.85  # minimum cosine sim to count as a rumination m
 RUMINATION_MIN_MATCHES   = 3     # how many such matches within the window triggers the guard
 RUMINATION_WINDOW_HOURS  = 24    # look-back window in hours
 
-# ── FAISS index ───────────────────────────────────────────────────────────────
-VECTOR_DIMENSION = 1024                              # bge-large-en-v1.5 output dim
-faiss_index      = faiss.IndexFlatIP(VECTOR_DIMENSION)  # Inner Product ≡ cosine sim on L2-normalised vecs
-id_mapping: dict[int, int] = {}                      # FAISS sequential index → SQLite node id
+VECTOR_DIMENSION = 1024  # bge-large-en-v1.5 output dim (used in init_db virtual table)
 
 # ── Model (loaded once at startup) ───────────────────────────────────────────
 _model: SentenceTransformer | None = None
@@ -171,6 +168,10 @@ def init_db() -> None:
                 user_id      TEXT PRIMARY KEY DEFAULT 'local',
                 flag_count   INTEGER DEFAULT 0,
                 last_updated TEXT
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
+                embedding float[1024]
             );
         """)
         
@@ -258,6 +259,9 @@ async def lifespan(app: FastAPI):
     conn = get_connection()
     try:
         conn.execute("DELETE FROM vec_embeddings")
+    except Exception as e:
+        log.warning("Could not clear vec_embeddings (may be empty): %s", e)
+    try:
         rows = conn.execute(
             "SELECT id, vector_embedding FROM drift_nodes ORDER BY id ASC"
         ).fetchall()
@@ -268,8 +272,8 @@ async def lifespan(app: FastAPI):
                 if len(vec) == VECTOR_DIMENSION:
                     vec_np = np.array([vec], dtype=np.float32)
                     normalize_l2(vec_np)
-                    conn.execute("INSERT INTO vec_embeddings(rowid, embedding) VALUES (?, ?)", 
-                                 (row["id"], sqlite_vec.serialize_float32(vec_np[0])))
+                    conn.execute("INSERT INTO vec_embeddings(rowid, embedding) VALUES (?, ?)",
+                                 (row["id"], sqlite_vec.serialize_float32(vec_np[0].tolist())))
                     count += 1
             conn.commit()
             log.info("sqlite-vec index loaded with %d existing vectors.", count)
@@ -436,135 +440,7 @@ def check_rumination(conn, current_vec, current_text):
         "similarity_to_mean":  round(similarity, 4),
     }
 
-# ── Graph logic & Rumination Guard ───────────────────────────────────────────
-def process_graph_and_guard(
-    new_node_id: int,
-    new_vector:  list[float],
-    new_tags:    list[str],
-    timestamp:   str,
-    conn:        sqlite3.Connection,
-) -> bool:
-    """
-    Build graph links for the new node and detect rumination.
-
-    Semantic links   → resolved via FAISS top-K search (fast, scalable).
-    Context links    → resolved via SQLite tag-overlap (no vector math needed).
-    Rumination guard → piggy-backs on the same FAISS pass.
-
-    Returns
-    -------
-    bool
-        True  → rumination loop detected.
-        False → no rumination.
-    """
-    cursor = conn.cursor()
-    links_to_insert: list[tuple[int, int, str, str]] = []  # (source, target, type, details)
-
-    # ── Parse the rumination window cut-off ───────────────────────────────────
-    try:
-        now_dt = datetime.fromisoformat(timestamp).replace(tzinfo=timezone.utc)
-    except ValueError:
-        now_dt = datetime.now(timezone.utc)
-    rumination_cutoff = now_dt - timedelta(hours=RUMINATION_WINDOW_HOURS)
-    rumination_count = 0
-    
-    threshold = compute_adaptive_threshold(conn)
-
-    # ── 1. FAISS search — Semantic links + Rumination Guard ───────────────────
-    if faiss_index.ntotal > 0:
-        query = np.array([new_vector], dtype=np.float32)
-        faiss.normalize_L2(query)
-
-        k = min(10, faiss_index.ntotal)
-        distances, indices = faiss_index.search(query, k)
-
-        for faiss_pos, sim in zip(indices[0], distances[0]):
-            if faiss_pos < 0:                           # unfilled slot sentinel
-                continue
-            hist_id = id_mapping.get(int(faiss_pos))
-            if hist_id is None or hist_id == new_node_id:
-                continue
-
-            # Semantic link
-            if sim > threshold:
-                details = f"{int(sim * 100)}% Semantic Match"
-                links_to_insert.append((new_node_id, hist_id, "Semantic", details))
-                log.debug(
-                    "Semantic link: %d → %d (sim=%.4f)", new_node_id, hist_id, sim
-                )
-
-            # Rumination Guard — check the time window via DB
-            if sim > RUMINATION_SIM_THRESHOLD:
-                row = cursor.execute(
-                    "SELECT timestamp FROM drift_nodes WHERE id = ?", (hist_id,)
-                ).fetchone()
-                if row:
-                    try:
-                        hist_dt = datetime.fromisoformat(row["timestamp"]).replace(
-                            tzinfo=timezone.utc
-                        )
-                    except ValueError:
-                        hist_dt = datetime.min.replace(tzinfo=timezone.utc)
-                    if hist_dt >= rumination_cutoff:
-                        rumination_count += 1
-                        log.debug(
-                            "Rumination candidate: node %d (sim=%.4f)", hist_id, sim
-                        )
-
-    # ── 2. Context links — tag overlap only (SQLite, no vectors) ─────────────
-    new_tags_set = {t.lower().strip() for t in new_tags}
-    if new_tags_set:
-        for row in cursor.execute(
-            "SELECT id, context_tags FROM drift_nodes WHERE id != ?", (new_node_id,)
-        ).fetchall():
-            hist_tags = {
-                t.lower().strip()
-                for t in json.loads(row["context_tags"] or "[]")
-            }
-            shared_tags = new_tags_set & hist_tags
-            if len(shared_tags) >= CONTEXT_LINK_MIN_TAGS:
-                details = f"Shared Context: {len(shared_tags)} tag{'s' if len(shared_tags) != 1 else ''}"
-                links_to_insert.append((new_node_id, row["id"], "Context", details))
-                log.debug(
-                    "Context link: %d → %d (shared=%s)",
-                    new_node_id, row["id"], shared_tags,
-                )
-
-    # ── 3. Batch-insert links (duplicate-safe) ────────────────────────────────
-    for source, target, ltype, details in links_to_insert:
-        cursor.execute(
-            """
-            INSERT INTO drift_links (source_id, target_id, link_type, details)
-            SELECT ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM drift_links
-                WHERE source_id = ? AND target_id = ? AND link_type = ?
-            )
-            """,
-            (source, target, ltype, details, source, target, ltype),
-        )
-    conn.commit()
-
-    # ── 4. Add new vector to FAISS index ─────────────────────────────────────
-    new_vec_np = np.array([new_vector], dtype=np.float32)
-    faiss.normalize_L2(new_vec_np)
-    new_faiss_pos = faiss_index.ntotal          # position before add
-    faiss_index.add(new_vec_np)
-    id_mapping[new_faiss_pos] = new_node_id
-    log.debug(
-        "FAISS index updated: total=%d, new_pos=%d → node id=%d",
-        faiss_index.ntotal, new_faiss_pos, new_node_id,
-    )
-
-    # ── 5. Rumination result ──────────────────────────────────────────────────
-    rumination_detected = rumination_count >= RUMINATION_MIN_MATCHES
-    if rumination_detected:
-        log.warning(
-            "RUMINATION GUARD triggered for node %d — %d similar nodes in last %dh",
-            new_node_id, rumination_count, RUMINATION_WINDOW_HOURS,
-        )
-    return rumination_detected
-    return rumination_detected
+# ── Graph logic ───────────────────────────────────────────────────────────────
 
 # ── Transitive Reduction ──────────────────────────────────────────────────────
 class TransitiveReducer:
@@ -664,40 +540,53 @@ def _format_full_text(payload: EntryPayload) -> str:
 
 def find_semantic_chain_link(conn, current_vec, current_id, threshold):
     """
-    Walks backwards through entry history.
-    Returns at most ONE link — the nearest 
-    semantically meaningful predecessor.
-    Ensures chain topology, not web topology.
+    Uses sqlite-vec KNN search to find the nearest semantically
+    meaningful predecessor entry. Returns at most ONE link — the nearest
+    predecessor above the adaptive threshold. Chain topology, not web.
     """
+    vec_np = np.array(current_vec, dtype=np.float32)
+    normalize_l2(vec_np.reshape(1, -1))
+    query_blob = sqlite_vec.serialize_float32(vec_np.tolist())
+
+    # KNN search: find top-5 nearest neighbours from vec_embeddings.
+    # sqlite-vec vec0 returns L2 (Euclidean) distance, NOT cosine distance.
+    # For L2-normalised unit vectors: L2_dist = sqrt(2*(1 - cos_sim))
+    # Therefore: cos_sim = 1 - (L2_dist^2 / 2)
     rows = conn.execute("""
-        SELECT id, timestamp, automatic_thought,
-               situation, entry_type, context_tags,
-               vector_embedding, wellness_label
-        FROM drift_nodes
-        WHERE id < ?
-          AND vector_embedding IS NOT NULL
-        ORDER BY id DESC
-        LIMIT 20
-    """, (current_id or 999999,)).fetchall()
-    
+        SELECT
+            v.rowid        AS node_id,
+            v.distance     AS vec_distance,
+            n.timestamp,
+            n.automatic_thought,
+            n.situation,
+            n.entry_type,
+            n.context_tags
+        FROM vec_embeddings v
+        JOIN drift_nodes n ON n.id = v.rowid
+        WHERE v.embedding MATCH ?
+          AND k = 5
+        ORDER BY v.distance ASC
+    """, (query_blob,)).fetchall()
+
     for row in rows:
-        vec = blob_to_vec(row["vector_embedding"])
-        sim = cosine_similarity(current_vec, vec)
-        
-        if sim >= threshold:
-            preview = (
-                row["automatic_thought"] or
-                row["situation"] or ""
-            )
+        node_id = row["node_id"]
+        # Correct conversion: cos_sim = 1 - L2_dist² / 2  (for unit vectors)
+        dist = float(row["vec_distance"])
+        similarity = 1.0 - (dist * dist) / 2.0
+
+        # Skip self-match
+        if current_id is not None and node_id == current_id:
+            continue
+
+        if similarity >= threshold:
+            preview = (row["automatic_thought"] or row["situation"] or "")
             return [{
-                "target_id":  row["id"],
-                "similarity": round(sim, 4),
+                "target_id":  node_id,
+                "similarity": round(similarity, 4),
                 "created_at": row["timestamp"],
                 "preview":    preview[:120],
                 "entry_type": row["entry_type"] or "free_form",
-                "tags": json.loads(
-                    row["context_tags"] or "[]"
-                ),
+                "tags": json.loads(row["context_tags"] or "[]"),
                 "link_type": "semantic",
             }]
     return []
@@ -800,8 +689,8 @@ def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
             all_np = np.array(all_vecs, dtype=np.float32)
             curr_np = np.array([vector], dtype=np.float32)
             
-            faiss.normalize_L2(all_np)
-            faiss.normalize_L2(curr_np)
+            normalize_l2(all_np)
+            normalize_l2(curr_np)
             
             # Compute similarities to all nodes
             sims = np.dot(all_np, curr_np[0])
@@ -945,8 +834,8 @@ def benchmark_analyze(payload: EntryPayload) -> dict[str, Any]:
             all_np = np.array(all_vecs, dtype=np.float32)
             curr_np = np.array([vector], dtype=np.float32)
             
-            faiss.normalize_L2(all_np)
-            faiss.normalize_L2(curr_np)
+            normalize_l2(all_np)
+            normalize_l2(curr_np)
             
             sims = np.dot(all_np, curr_np[0])
             mu = float(np.mean(sims))
@@ -1153,12 +1042,14 @@ def save_thought(payload: SaveEntryPayload, background_tasks: BackgroundTasks) -
                 
         conn.commit()
         
-        # Insert into FAISS
-        new_vec_np = np.array([vector], dtype=np.float32)
-        faiss.normalize_L2(new_vec_np)
-        new_faiss_pos = faiss_index.ntotal
-        faiss_index.add(new_vec_np)
-        id_mapping[new_faiss_pos] = new_node_id
+        # Insert into sqlite-vec
+        vec_np = np.array(vector, dtype=np.float32)
+        normalize_l2(vec_np.reshape(1, -1))
+        conn.execute(
+            "INSERT OR REPLACE INTO vec_embeddings(rowid, embedding) VALUES (?, ?)",
+            (new_node_id, sqlite_vec.serialize_float32(vec_np.tolist()))
+        )
+        conn.commit()
 
     except sqlite3.Error as exc:
         conn.rollback()

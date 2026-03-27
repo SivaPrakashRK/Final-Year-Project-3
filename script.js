@@ -130,8 +130,10 @@ function renderGraph() {
     // Use all links for the new zero-strength physics engine binding
     const baseLinks = state.graphData.links;
 
-    // Process links to cap Semantic links to 5 per node
+    // [DEBUG] Trace semantic link pipeline — remove when fixed
+    console.log('[SEM] Total links:', baseLinks.length, '| types:', baseLinks.map(l => l.link_type || l.type));
     const semanticLinksRaw = baseLinks.filter(l => (l.type || l.link_type || '').toLowerCase() === 'semantic');
+    console.log('[SEM] semanticLinksRaw:', semanticLinksRaw.length, semanticLinksRaw);
     const otherLinks = baseLinks.filter(l => (l.type || l.link_type || '').toLowerCase() !== 'semantic');
 
     // -- TRANSITIVE REDUCTION -------------------------------------------
@@ -195,8 +197,11 @@ function renderGraph() {
                 const gap = Math.abs(tDate - sDate) / (1000 * 60 * 60 * 24);
 
                 if (gap < minTemporalGap) {
+                    // Only remove if an INDIRECT path (2+ hops) exists through intermediate nodes.
+                    // A direct chronological edge between the same pair is a different link type
+                    // and does NOT make a semantic link redundant.
                     const path = this.findPath(sourceId, targetId);
-                    if (path.length > 0) return false; // Redundant chronological path exists
+                    if (path.length > 2) return false; // Indirect multi-hop path makes it redundant
                 }
                 return true;
             });
@@ -204,7 +209,7 @@ function renderGraph() {
     }
 
     const reducer = new TransitiveReducer(state.graphData.nodes, baseLinks);
-    const reducedSemanticLinks = reducer.reduce(semanticLinksRaw, { minTemporalGap: 2 });
+    const reducedSemanticLinks = reducer.reduce(semanticLinksRaw, { minTemporalGap: 7 });
 
     reducedSemanticLinks.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
     const nodeSemanticCounts = {};
@@ -247,8 +252,8 @@ function renderGraph() {
             d.text || "",
             d.automatic_thought || "",
             ...(d.tags || []),
-            d.drift_label || "",
-            d.wellness_label || ""
+            d.cognitive_drift || "",
+            d.wellness || ""
         ].join(" ").toLowerCase();
 
         d._highlighted = strOpts.includes(query);
@@ -303,7 +308,7 @@ function renderGraph() {
     };
 
     const link = linkGroup.selectAll("g.link-wrapper")
-        .data(readyLinks, d => d.id || `${d.source.id || d.source}-${d.target.id || d.target}-${d.type}`);
+        .data(readyLinks, d => d.id || `${d.source.id || d.source}-${d.target.id || d.target}-${d.link_type || d.type}`);
 
     const linkEnter = link.join(
         enter => {
@@ -409,8 +414,8 @@ function renderGraph() {
                     const cdStr = (d.cognitive_drift > 0) ? `<div style="margin-top:6px; color:#f4a942">Loop similarity: ${Math.round(d.cognitive_drift * 100)}%</div>` : '';
 
                     tooltip.html(`
-                        <div style="font-weight:600; margin-bottom:4px; color:var(--accent,#7c6af7)">${d.drift_label || d.entry_type || "Note"}</div>
-                        <div style="margin-bottom:6px; color:#8888a8">${d.wellness_label || "Neutral"}</div>
+                        <div style="font-weight:600; margin-bottom:4px; color:var(--accent,#7c6af7)">${d.cognitive_drift || d.entry_type || "Note"}</div>
+                        <div style="margin-bottom:6px; color:#8888a8">${d.wellness || "Neutral"}</div>
                         <div style="line-height:1.4">${preview}...</div>
                         ${tagsStr}
                         ${cdStr}
@@ -552,7 +557,7 @@ function renderGraph() {
         el.select(".node-date").text(formattedDate);
 
         // Tag label
-        let tagStr = d.drift_label ? `* ${d.drift_label}` : "";
+        let tagStr = d.cognitive_drift ? `* ${d.cognitive_drift}` : "";
         if (d.tags && d.tags.length > 0) {
             tagStr = `# ${d.tags[0]}`;
             el.select(".node-tag").style("font-style", "normal");
@@ -745,7 +750,7 @@ function openNodeDetail(node) {
 
     const dt = node.timestamp || node.date;
     document.getElementById('detail-date').innerText = dt ? new Date(dt).toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' }) : 'Unknown Date';
-    document.getElementById('detail-drift-badge').innerText = node.drift_label || "None";
+    document.getElementById('detail-drift-badge').innerText = node.cognitive_drift || "None";
     document.getElementById('detail-wellness-badge').innerText = (node.wellness_label || node.wellness || "Neutral").replace(/\b\w/g, c => c.toUpperCase());
 
     const body = document.getElementById('detail-content-area');
