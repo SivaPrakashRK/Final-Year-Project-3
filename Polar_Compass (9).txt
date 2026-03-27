@@ -1,154 +1,0 @@
-
-Cognitive Canvas: An AI-Powered Local-First Spatial Journaling Framework
-Kirubasri Ga), Priyangga Tb), Santhosh Sc), Siva Prakash R Kd), Rishi Shankar Me)
-Department of Computer Science and Engineering, Sona College of Technology,
-Salem – 636005, Tamil Nadu, India
-a) Corresponding Author: kirubasri.cse@sonatech.ac.in
-b) priyangga.22cse@sonatech.ac.in
-c)santhosh.22cse@sonatech.ac.in
-d) sivaprakash.22cse@sonatech.ac.in
-e) rishishankar.22cse@sonatech.ac.in
-
-Abstract: Contemporary digital journaling applications fail to surface longitudinal psycho- logical patterns, and cloud-dependent AI augmentations introduce acute privacy risks incompatible with the intimate nature of personal reflection data. A further concern is the deployment of opaque large language models (LLMs) in sensitive self-reflection contexts, as their outputs are probabilistic, unverifiable, and prone to hallucination [10]. This paper presents Cognitive Canvas, a local-first, privacy-preserving spatial journaling framework that transforms free-form textual entries into an interactive, directed knowledge graph entirely on consumer-grade hardware—without cloud inference or generative LLM involvement. The system encodes each journal entry into dense semantic vectors using a locally quantised transformer model, indexes those vectors via sqlite-vec at sub-second retrieval latency, and constructs a directed graph through a temporally-constrained Tripartite Linking protocol. Cognitive Canvas establishes a reproducible architectural baseline for privacy-first, interpretable, spatially rendered cognitive self-reflection tools.
-
-Keywords: Spatial Journaling; Privacy-Preserving AI; Local-First Architecture, Knowledge Graph; Cognitive Drift Detection; Human-in-the-Loop; LLM Hallucination
-I. Introduction
-   Personal journaling is among the most empirically validated interventions for emo- tional regulation, stress reduction, and metacognitive development [1, 2]. Despite this, the transition of journaling into the digital domain has largely preserved its most limit- ing structural property: strict chronological linearity. Entries accumulate as flat text se- quences, burying temporally distant but thematically proximate reflections beneath layers of irrelevant content and rendering long-range psychological pattern detection practically infeasible for both user and system.
-   The advent of large language models (LLMs) and semantic search has prompted a wave of “AI-assisted journaling” products that promise to surface such patterns auto- matically [3]. However, practically all production deployments in this category transmit entry content to remote inference endpoints, exposing intimate self-reflection data to third-party servers, algorithmic surveillance, and the ever-present risk of data breach [4]. A systematic examination of existing AI journaling tools reveals five persistent defi- ciencies: cloud-mandatory inference, static semantic thresholding, an absence of temporal topology, clinical framing without clinical validation, and LLM opacity and hallucination risk [5,6,10]. Cognitive Canvas is designed to close all five gaps simultaneously by running its entire inference pipeline on local consumer hardware using deterministic, auditable
-models rather than generative LLMs.
-      The remainder of this paper is structured as follows. Section II surveys related work. Section III formalises the problem statement and proposed methodology. Sections IV, V, and VI detail the system’s input processing, core linking logic, and output visualisation. Section VII outlines innovative contributions. Section VIII reports performance metrics. Sections IX and X conclude with future directions.
-
-
-II. Related Work
-   Early computational approaches to journaling analysis focused on lexicon-based af- fect scoring, producing aggregate sentiment statistics rather than relational structure. More recent systems leverage transformer-based language models for deeper semantic representation. One system [3] employs GPT-4 as a conversational journaling partner, demonstrating measurable improvements in reflection depth; however, it requires a per- sistent internet connection and routes all data through a cloud inference API.
-   A further system [7] extends journaling with passive physiological sensing, but its reliance on invasive sensor data introduces a distinct privacy surface. A graph-based prototype [8] adopts a knowledge-graph representation, yet applies a static similarity threshold (? = 0.78) and does not support local execution.
-   Cognitive Canvas addresses these concerns by replacing generative inference with deterministic, locally auditable embedding similarity—every graph edge carries a cosine- similarity provenance value that users can inspect. On the infrastructure side, Cognitive Canvas adopts the sqlite-vec embedded vector store for tighter OLTP integration with the SQLite3 application database, and builds on recent work confirming that sub-billion parameter quantised transformer models achieve competitive encoding quality on con- sumer CPUs [11, 12].
-
-
-1 Problem Statement and Proposed Methodology
-
-1.1 Problem Formulation
-   Let E = {e1, e2, . . . , en} denote a chronologically ordered corpus of journal entries authored by a single user, where each entry ei is a natural language text document associated with a timestamp ti. The system must compute a dense vector representation vi ? Rd for each entry locally, maintain a persistent queryable index, and construct a directed graph G = (V, E) encoding semantic and contextual relationships without any network egress.
-
-1.2 Proposed Methodology
-   Cognitive Canvas satisfies the above formulation through three tightly integrated local components.
-
-1.2.1 BGE-Large Embedding Engine
-
-   Each entry is encoded by a locally deployed, INT8-quantised BAAI/bge-large-en-v1.5 model optimised for semantic textual similarity [12]. Quantisation enables parallel execution alongside the inference runtime on a 16 GB system. The resulting 1024-dimensional embedding is L2-normalised prior to indexing.
-
-1.2.2 sqlite-vec Vector Store
-
-   L2-normalised embeddings are inserted into a sqlite-vec embedded vector database, co-locating vector similarity search with the SQLite3 relational store. This ensures all user data remains within one local database file.
-
-1.2.3 FastAPI Input Pipeline
-
-   Submitted entry text undergoes standardisation before forwarding to the embedding stage, with a FastAPI backend routing each request locally.
-
-2 Input Processing and Vector Encoding
-
-2.1 Architectural Overview
-   Cognitive Canvas adopts a layered client-server architecture confined entirely to the local device. A FastAPI backend exposes a REST interface consumed by an HTML/D3.js frontend; both processes bind exclusively to localhost and are inaccessible from external networks.
-
-2.2 Input Processing
-   Raw text submitted through the journaling interface undergoes Unicode normalisation (NFC) and punctuation standardisation. User-assigned context tags are extracted from the structured input fields and stored as a JSON array alongside the entry text before forwarding to the next stage.
-
-2.3 Vector Encoding
-   The sanitised entry text is encoded by the quantised BGE-Large model. The forward pass produces a 1024-dimensional hidden-state tensor; the mean-pooled representation is extracted as the sentence embedding vi, then L2-normalised:
-
-
-
-
-
-
-
-3 Core Logic and Graph Linking
-
-3.1 Adaptive Thresholding and Graph Linking
-   Rather than applying a fixed cosine threshold ? , Cognitive Canvas computes a user- adaptive threshold from the statistical distribution of the personal embedding corpus:
-
-Tadaptive = µuser + ?user,	(2)
-
-
-where µuser and ?user denote the mean and standard deviation of pairwise cosine similar- ities across all entries.
-   The Tripartite Linking Logic evaluates three edge categories. Semantic Chain Links (Cyan): The system walks backwards to identify the first predecessor whose sim- ilarity exceeds Tadaptive, inserting a single directed semantic edge. Contextual Chain Links (Purple): A directed edge connects to the most recent prior entry sharing explicit user-assigned tags. Compensatory Links (Amber): Entries with opposing emotional valence (classified by deberta-v3-base) and high similarity within a 7-day window re-
-
-ceive an edge mapping psychological oscillations [14].
-
-
-3.2 Cognitive Drift Computation
-
-The system computes a Cognitive Drift score CD(W ) for a sliding temporal window
-W :
-
-
-where µW is the centroid of embeddings within W and µglobal is the global embedding centroid. The metric is non-pathological, quantifying directional cognitive change without labelling it as distorted.
-
-3.3 Rumination Guard
-   The Rumination Guard monitors for sustained semantic loops co-occurring with neg- ative affect. If a high semantic similarity (Tsim = 0.88) and negative valence probability (Pneg = 0.70) persists across K = 3 consecutive entries, the system presents a wellness intervention offering cognitive reappraisal prompts [18].
-
-4 Output and Visualisation
-
-4.1 Rigid Narrative Timeline Visualisation
-   Unlike conventional force-directed layouts, Cognitive Canvas implements a Rigid Narrative Timeline: nodes are positioned deterministically on a horizontal chronological axis. AI-inferred arcs are rendered as alternating quadratic Bézier curves to prevent visual occlusion, and Client-side Transitive Reduction [15] suppresses redundant arcs.
-
-4.2 Human-in-the-Loop Link Verification
-   All AI-proposed edges are presented to the user via a Floating Command Center before database persistence. The API computes candidate links but only persists those explicitly
-
-approved by the user, preserving human interpretive authority over the cognitive map [16, 17]. Chronological links are the sole exception, auto-verified as structural edges.
-
-5 Innovative Contributions Summary
-   Cognitive Canvas closes multiple gaps present in existing literature by implement- ing distinct architectural and experiential innovations. Fully Local Inference: Zero reliance on external APIs, ensuring self-reflection data never leaves the user’s hardware. Adaptive Similarity Thresholding: Automatically calibrates linking thresholds based on a user’s unique lexical footprint rather than arbitrary static limits. Temporal Graph Topology: Preserves chronological context by embedding semantic relationships onto a rigid timeline, revealing the narrative arc of psychological change. Human-in-the-Loop (HITL) Verification: Enforces explicit user consent for all machine-inferred semantic and emotional links before they are saved. Non-Pathological Tracking: Introduces a Cognitive Drift metric and Rumination Guard that surface insights without relying on harmful or restrictive clinical labels. GPU-Free Deployment: Engineered to run complex NLP indexing and vector search smoothly on standard consumer processors.
-Table 1: Feature Comparison: Cognitive Canvas vs. Closest Published Alternatives.
-? = fully supported; × = not supported; ? = partial.	
-FeatureCognitive Canvas[3][8][7]Fully local inference?×××Adaptive sim. threshold?×××Temporal graph topology?×~×HITL link verification?×××Rumination detection?~××Non-patho. drift metric?×××GPU-free deployment?×××
-
-
-6 Evaluation Setup and Performance Metrics
-   Pilot evaluation was conducted on a consumer-grade laptop featuring a 12th Gen Intel Core i5-12450HX, 16.0 GB RAM, and Windows 11 Pro, explicitly without any dis-
-
-crete GPU or hardware accelerator to establish a reproducible baseline. The evaluation corpus comprised 200 manually authored journal entries over eight weeks, with 35 pairs independently annotated by domain experts (? = 0.81).
-Table 2 summarises the measured system performance.
-
-Table 2: System Performance Metrics (Pilot Evaluation — Intel Core i5-12450HX, 16 GB RAM, No GPU)	
-
-MetricMeasuredTargetVector embedding time170.9 ms< 250 mssqlite-vec top-5 retrieval time4.7 ms< 50 msFastAPI & model-serving overhead2050.5 ms—Total end-to-end HTTP latency3944.7 ms—Semantic link precision80%> 75%Baseline static precision60%—Peak RAM usage5.1 GB< 12 GBD3.js timeline frame rate60 FPS60 FPS
-   The Adaptive Min-P threshold Tadaptive yielded a semantic link precision of 80% against human annotation, a relative improvement of 33.3% over the fixed ? = 0.78 baseline (60%). This confirms the value of sensitivity to the individual’s personal vocabulary distribution. Furthermore, Cognitive Drift scores correlated positively (r = 0.67, p < 0.01) with concurrent self-reported perceived stress ratings.
-   Retrieval-critical operations operated well within interactive bounds on CPU-only hardware, though the 3944.7 ms total HTTP latency was dominated by synchronous classification serving (2050.5 ms), marking a key optimisation target.
-
-7 Conclusion
-   Cognitive Canvas proves the practical viability of a fully local, privacy-preserving spatial journaling framework. By successfully orchestrating dense semantic retrieval, adaptive graph construction, and deterministic chronological visualisation natively on consumer-grade hardware, the system eliminates the need for cloud dependency or gen- erative LLM involvement. It effectively resolves persistent issues in AI journaling tools, bridging the gap between rigorous psychological structure and absolute data sovereignty.
-
-8 Future Work
-   Future iterations of the framework will prioritize the following expansions. Latency Optimisation: Implementing INT4 model quantisation and asynchronous background inference to reduce classification serving overhead. Longitudinal Validation: Deploy- ing standardized psychometric tracking across a multi-user clinical cohort to formalize the Cognitive Drift and Rumination Guard metrics. Multimodal Integration: Adapt- ing local speech recognition and OCR to map audio and handwritten journal inputs se- curely. Federated Personalisation: Utilizing encrypted, federated learning approaches to fine-tune threshold calibrations across diverse user communities. Extractive Sum- marisation: Replacing AI-generated prose with constrained, verbatim extractive spans to create hallucination-resistant reflection summaries.
-
-Acknowledgment
-   The authors thank the volunteer participants of the pilot evaluation and the anony- mous reviewers whose constructive feedback improved this manuscript.
-
-References
-[1] J. W. Pennebaker and J. D. Seagal, “Forming a story: The health benefits of narra- tive,” J. Clin. Psychol., vol. 55, no. 10, pp. 1243–1254, 1997.
-[2] J. M. Smyth, “Written emotional expression: Effect sizes, outcome types, and mod- erating variables,” J. Consult. Clin. Psychol., vol. 66, no. 1, pp. 174–184, 1998.
-[3] T. Kim et al., “MindfulDiary: Harnessing large language model to support psychi- atric patients’ journaling,” in Proc. 2024 CHI Conf. Human Factors Comput. Syst. (CHI ’24), New York, NY, USA: ACM, Article 701, pp. 1–20, 2024.
-[4] G. Feretzakis et al., “Privacy-preserving techniques in generative AI and large lan- guage models: A narrative review,” Information, vol. 15, p. 697, 2024.
-
-[5] J. S. Tauscher et al., “Automated detection of cognitive distortions in text exchanges between clinicians and people with serious mental illness,” Psychiatric Services, vol. 74, no. 4, pp. 407–410, 2023.
-[6] A. Sage, J. Keppens, and H. Yannakoudakis, “A survey of cognitive distortion detec- tion and classification in NLP,” in Findings of ACL: EMNLP 2025, pp. 14884–14899, 2025.
-[7] S. Nepal et al., “MindScape study: Integrating LLM and behavioral sensing for personalized AI-driven journaling experiences,” Proc. ACM Interact. Mob. Wearable Ubiquitous Technol., vol. 8, no. 4, Article 186, pp. 1–44, Dec. 2024.
-[8] N. Elsharawi and A. El Bolock, “C-Journal: A journaling application for de- tecting and classifying cognitive distortions using deep-learning,” in Proc. LREC- COLING 2024, Torino, Italia: ELRA and ICCL, pp. 3224–3234, 2024.
-[9] P. Lewis et al., “Retrieval-augmented generation for knowledge-intensive NLP tasks,” in Proc. NeurIPS, 2020, pp. 9459–9474.
-[10] Z. Ji et al., “Survey of hallucination in natural language generation,” ACM Comput. Surv., vol. 55, no. 12, pp. 1–38, 2023.
-[11] J. Johnson, M. Douze, and H. Jégou, “Billion-scale similarity search with GPUs,”
-IEEE Trans. Big Data, vol. 7, no. 3, pp. 535–547, 2021.
-
-[12] T. Dettmers, M. Lewis, Y. Belkada, and L. Zettlemoyer, “LLM.int8(): 8-bit matrix multiplication for transformers at scale,” in Proc. NeurIPS, 2022.
-[13] B. P. Welford, “Note on a method for calculating corrected sums of squares and products,” Technometrics, vol. 4, no. 3, pp. 419–420, 1962.
-[14] P. He, X. Liu, J. Gao, and W. Chen, “DeBERTa: Decoding-enhanced BERT with disentangled attention,” in Proc. ICLR, 2021.
-[15] A. V. Aho, M. R. Garey, and J. D. Ullman, “The transitive reduction of a directed graph,” SIAM J. Comput., vol. 1, no. 2, pp. 131–137, 1972.
-
-[16] S. Amershi et al., “Power to the people: The role of humans in interactive machine learning,” AI Mag., vol. 35, no. 4, pp. 105–120, 2014.
-[17] E. Horvitz, “Principles of mixed-initiative user interfaces,” in Proc. ACM CHI, 1999,
-pp. 159–166.
-
-[18] D. Greenberger and C. A. Padesky, Mind Over Mood: Change How You Feel by Changing the Way You Think. New York, NY: Guilford Press, 1995.
-
-

@@ -372,11 +372,13 @@ function renderGraph() {
                     }
                 });
 
-            return g;
         },
         update => update,
         exit => exit.remove()
     );
+
+    // Propagate updated data to all child lines so D3 simulation updates their coordinates
+    linkEnter.selectAll("line").datum(function() { return this.parentNode.__data__; });
 
     // Render Nodes
     const getNodeStroke = (d) => {

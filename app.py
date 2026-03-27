@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 os.environ["HF_HOME"] = "d:/huggingface"
-import faiss
+import sqlite_vec
 import json
 import logging
 import sqlite3
@@ -57,6 +57,12 @@ def cosine_similarity(v1, v2):
     if norm1 > 0 and norm2 > 0:
         return float(np.dot(vec1, vec2) / (norm1 * norm2))
     return 0.0
+
+def normalize_l2(x: np.ndarray) -> None:
+    # In-place L2 normalization mimicking faiss.normalize_L2
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms[norms == 0] = 1 # prevent zero division
+    x /= norms
 
 def compute_adaptive_threshold(conn):
     rows = conn.execute(
@@ -128,6 +134,9 @@ def get_model() -> SentenceTransformer:
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
     return conn
 
 
@@ -245,29 +254,27 @@ async def lifespan(app: FastAPI):
     init_db()
     get_model()          # warm up — avoids cold-start latency on first request
 
-    # ── Pre-load existing vectors into the FAISS index ────────────────────────
+    # ── Pre-load existing vectors into sqlite-vec ────────────────────────
     conn = get_connection()
     try:
+        conn.execute("DELETE FROM vec_embeddings")
         rows = conn.execute(
             "SELECT id, vector_embedding FROM drift_nodes ORDER BY id ASC"
         ).fetchall()
+        count = 0
         if rows:
-            vectors = []
             for row in rows:
                 vec = json.loads(row["vector_embedding"] or "[]")
                 if len(vec) == VECTOR_DIMENSION:
-                    faiss_index_pos = len(id_mapping)
-                    id_mapping[faiss_index_pos] = row["id"]
-                    vectors.append(vec)
-            if vectors:
-                mat = np.array(vectors, dtype=np.float32)
-                faiss.normalize_L2(mat)
-                faiss_index.add(mat)
-                log.info(
-                    "FAISS index loaded with %d existing vectors.", faiss_index.ntotal
-                )
+                    vec_np = np.array([vec], dtype=np.float32)
+                    normalize_l2(vec_np)
+                    conn.execute("INSERT INTO vec_embeddings(rowid, embedding) VALUES (?, ?)", 
+                                 (row["id"], sqlite_vec.serialize_float32(vec_np[0])))
+                    count += 1
+            conn.commit()
+            log.info("sqlite-vec index loaded with %d existing vectors.", count)
     except Exception as exc:  # noqa: BLE001
-        log.error("Failed to pre-load FAISS index: %s", exc)
+        log.error("Failed to pre-load sqlite-vec index: %s", exc)
     finally:
         conn.close()
 
