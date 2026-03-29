@@ -13,19 +13,22 @@ os.environ["HF_HOME"] = "d:/huggingface"
 import sqlite_vec
 import json
 import logging
+import secrets
 import sqlite3
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline as hf_pipeline
+
+import hashlib
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -37,9 +40,68 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_FILE        = "drift_v2.db"
-MODEL_NAME     = "BAAI/bge-large-en-v1.5"
-EMBED_PREFIX   = "Represent this sentence for retrieval: "
+DB_FILE                  = "drift_v2.db"
+MODEL_NAME               = "BAAI/bge-large-en-v1.5"
+EMBED_PREFIX             = "Represent this sentence for retrieval: "
+SESSION_TIMEOUT_MINUTES  = 30
+
+# ── In-memory session store ───────────────────────────────────────────────────
+# { session_id: {"username": str, "created_at": datetime, "last_activity": datetime} }
+active_sessions: dict[str, dict] = {}
+
+# Short-lived tokens for password reset (valid 5 minutes)
+# { token: {"created_at": datetime} }
+reset_tokens: dict[str, dict] = {}
+
+# ── Local Passcode helpers ────────────────────────────────────────────────────
+def hash_passcode(passcode: str) -> str:
+    """SHA-256 hash of the passcode."""
+    return hashlib.sha256(passcode.encode("utf-8")).hexdigest()
+
+def hash_answer(answer: str) -> str:
+    """Normalise (lowercase + strip) then SHA-256 hash a security answer."""
+    return hashlib.sha256(answer.strip().lower().encode("utf-8")).hexdigest()
+
+
+def create_session(username: str) -> str:
+    """Create a new session token and store it in memory."""
+    session_id = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    active_sessions[session_id] = {
+        "username":      username,
+        "created_at":    now,
+        "last_activity": now,
+    }
+    return session_id
+
+
+def validate_session(session_id: str) -> tuple[bool, str]:
+    """Check if session is valid and not expired; refresh last_activity if valid."""
+    if session_id not in active_sessions:
+        return False, ""
+    session = active_sessions[session_id]
+    now = datetime.now(timezone.utc)
+    if now - session["last_activity"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
+        del active_sessions[session_id]
+        return False, ""
+    session["last_activity"] = now
+    return True, session["username"]
+
+
+def clear_session(session_id: str) -> None:
+    """Remove a session."""
+    active_sessions.pop(session_id, None)
+
+
+def require_auth(authorization: str = Header(None)) -> str:
+    """FastAPI dependency that validates the Bearer token from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.removeprefix("Bearer ")
+    valid, username = validate_session(token)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return username
 
 # Graph-linking thresholds (calibrated)
 CONTEXT_LINK_MIN_TAGS   = 2      # shared tags required for a Context link
@@ -149,8 +211,8 @@ def init_db() -> None:
                 situation        TEXT    NOT NULL,
                 automatic_thought TEXT   NOT NULL,
                 cognitive_drift  TEXT    NOT NULL DEFAULT 'None',
-                context_tags     TEXT    NOT NULL DEFAULT '[]',   -- JSON array
-                vector_embedding TEXT    NOT NULL DEFAULT '[]'    -- JSON array (1024-D)
+                context_tags     TEXT    NOT NULL DEFAULT '[]',
+                vector_embedding TEXT    NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS drift_links (
@@ -172,6 +234,14 @@ def init_db() -> None:
 
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
                 embedding float[1024]
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_user (
+                id                   INTEGER PRIMARY KEY CHECK (id = 1),
+                passcode_hash        TEXT NOT NULL,
+                security_question    TEXT NOT NULL,
+                security_answer_hash TEXT NOT NULL,
+                created_at           TEXT NOT NULL
             );
         """)
         
@@ -299,6 +369,190 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Serve frontend static files ───────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@app.get("/", include_in_schema=False)
+def serve_root():
+    return FileResponse(os.path.join(_BASE_DIR, "index.html"))
+
+@app.get("/style.css", include_in_schema=False)
+def serve_css():
+    return FileResponse(os.path.join(_BASE_DIR, "style.css"), media_type="text/css")
+
+@app.get("/script.js", include_in_schema=False)
+def serve_js():
+    return FileResponse(os.path.join(_BASE_DIR, "script.js"), media_type="application/javascript")
+
+# ── Auth Pydantic models ──────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    passcode: str
+
+class RegisterRequest(BaseModel):
+    passcode: str
+    security_question: str
+    security_answer: str
+
+class ForgotVerifyRequest(BaseModel):
+    security_answer: str
+
+class ResetPasscodeRequest(BaseModel):
+    reset_token: str
+    new_passcode: str
+
+class LoginResponse(BaseModel):
+    session_token: str
+    username: str
+    message: str
+
+class SessionCheckResponse(BaseModel):
+    valid: bool
+    username: Optional[str] = None
+
+# ── Auth Endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/auth/status", tags=["auth"])
+def auth_status():
+    """Check whether a user has been registered yet."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT id FROM auth_user WHERE id = 1").fetchone()
+        return {"registered": row is not None}
+    finally:
+        conn.close()
+
+
+@app.post("/auth/register", response_model=LoginResponse, tags=["auth"])
+def auth_register(request: RegisterRequest):
+    """First-time registration: set passcode and security question/answer."""
+    conn = get_connection()
+    try:
+        existing = conn.execute("SELECT id FROM auth_user WHERE id = 1").fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="User already registered. Use login instead.")
+        if len(request.passcode) < 4:
+            raise HTTPException(status_code=422, detail="Passcode must be at least 4 characters.")
+        if not request.security_question.strip() or not request.security_answer.strip():
+            raise HTTPException(status_code=422, detail="Security question and answer are required.")
+
+        username = os.getlogin()
+        conn.execute(
+            "INSERT INTO auth_user (id, passcode_hash, security_question, security_answer_hash, created_at) "
+            "VALUES (1, ?, ?, ?, ?)",
+            (hash_passcode(request.passcode),
+             request.security_question.strip(),
+             hash_answer(request.security_answer),
+             datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        token = create_session(username)
+        log.info("New user registered: %s", username)
+        return LoginResponse(session_token=token, username=username, message="Registration successful")
+    finally:
+        conn.close()
+
+
+@app.post("/auth/login", response_model=LoginResponse, tags=["auth"])
+def auth_login(request: LoginRequest):
+    """Verify local passcode and return a session token."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT passcode_hash FROM auth_user WHERE id = 1"
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No user registered. Please register first.")
+        if row["passcode_hash"] != hash_passcode(request.passcode):
+            raise HTTPException(status_code=401, detail="Incorrect passcode. Please try again.")
+        username = os.getlogin()
+        token = create_session(username)
+        log.info("Login success")
+        return LoginResponse(session_token=token, username=username, message="Authentication successful")
+    finally:
+        conn.close()
+
+
+@app.get("/auth/forgot/question", tags=["auth"])
+def auth_forgot_question():
+    """Return the registered security question (for the forgot-passcode flow)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT security_question FROM auth_user WHERE id = 1"
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No user registered.")
+        return {"question": row["security_question"]}
+    finally:
+        conn.close()
+
+
+@app.post("/auth/forgot/verify", tags=["auth"])
+def auth_forgot_verify(request: ForgotVerifyRequest):
+    """Verify the security answer and return a short-lived reset token (5 min)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT security_answer_hash FROM auth_user WHERE id = 1"
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No user registered.")
+        if row["security_answer_hash"] != hash_answer(request.security_answer):
+            raise HTTPException(status_code=401, detail="Incorrect answer. Please try again.")
+        reset_tok = secrets.token_urlsafe(24)
+        reset_tokens[reset_tok] = {"created_at": datetime.now(timezone.utc)}
+        return {"reset_token": reset_tok}
+    finally:
+        conn.close()
+
+
+@app.post("/auth/forgot/reset", response_model=LoginResponse, tags=["auth"])
+def auth_forgot_reset(request: ResetPasscodeRequest):
+    """Reset the passcode using a valid reset token."""
+    if request.reset_token not in reset_tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired reset token.")
+    created = reset_tokens[request.reset_token]["created_at"]
+    if datetime.now(timezone.utc) - created > timedelta(minutes=5):
+        del reset_tokens[request.reset_token]
+        raise HTTPException(status_code=401, detail="Reset token has expired. Please start over.")
+    if len(request.new_passcode) < 4:
+        raise HTTPException(status_code=422, detail="New passcode must be at least 4 characters.")
+
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE auth_user SET passcode_hash = ? WHERE id = 1",
+            (hash_passcode(request.new_passcode),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    del reset_tokens[request.reset_token]
+    username = os.getlogin()
+    token = create_session(username)
+    log.info("Passcode reset successfully")
+    return LoginResponse(session_token=token, username=username, message="Passcode reset successful")
+
+
+@app.post("/auth/logout", tags=["auth"])
+def auth_logout(authorization: str = Header(None)):
+    """Invalidate the current session."""
+    if authorization and authorization.startswith("Bearer "):
+        clear_session(authorization.removeprefix("Bearer "))
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/auth/check", response_model=SessionCheckResponse, tags=["auth"])
+def auth_check(authorization: str = Header(None)):
+    """Check if the current session token is still valid."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return SessionCheckResponse(valid=False)
+    token = authorization.removeprefix("Bearer ")
+    valid, username = validate_session(token)
+    return SessionCheckResponse(valid=valid, username=username if valid else None)
+
 
 # ── Pydantic schema ───────────────────────────────────────────────────────────
 class EntryPayload(BaseModel):
@@ -647,7 +901,7 @@ def find_contextual_chain_link(conn, tags, current_id):
 
 
 @app.post("/analyze_thought")
-def analyze_thought(payload: EntryPayload) -> dict[str, Any]:
+def analyze_thought(payload: EntryPayload, _username: str = Depends(require_auth)) -> dict[str, Any]:
     full_text = _format_full_text(payload)
     
     # Generate Embedding
@@ -970,7 +1224,7 @@ def run_zero_shot_analysis(node_id: int, user_id: int, full_text: str, automatic
         log.error("Background task failed for node %d: %s", node_id, exc)
 
 @app.post("/save_thought")
-def save_thought(payload: SaveEntryPayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def save_thought(payload: SaveEntryPayload, background_tasks: BackgroundTasks, _username: str = Depends(require_auth)) -> dict[str, Any]:
     full_text = _format_full_text(payload)
     timestamp = payload.timestamp if payload.timestamp else datetime.now(timezone.utc).isoformat()
     
@@ -1081,7 +1335,7 @@ def save_thought(payload: SaveEntryPayload, background_tasks: BackgroundTasks) -
 
 # ── GET /get_graph_data ───────────────────────────────────────────────────────
 @app.get("/get_graph_data")
-async def get_graph_data() -> dict[str, list[dict]]:
+async def get_graph_data(_username: str = Depends(require_auth)) -> dict[str, list[dict]]:
     """
     Return all nodes (without their heavyweight vector embeddings) and all
     links, ready for D3.js consumption.
@@ -1319,6 +1573,48 @@ async def export_report() -> PlainTextResponse:
         media_type="text/markdown",
         headers={"Content-Disposition": "attachment; filename=cognitive_drift_report.md"},
     )
+
+
+# ── DELETE /nodes/{node_id} ───────────────────────────────────────────────────
+@app.delete("/nodes/{node_id}", tags=["nodes"])
+def delete_node(node_id: int, username: str = Depends(require_auth)):
+    """
+    Permanently delete a node and all of its associated links and vector embedding.
+    Requires a valid session token.
+    """
+    conn = get_connection()
+    try:
+        # 1. Verify the node exists
+        row = conn.execute(
+            "SELECT id FROM drift_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Node {node_id} not found.")
+
+        # 2. Delete all links that reference this node (as source or target)
+        conn.execute(
+            "DELETE FROM drift_links WHERE source_id = ? OR target_id = ?",
+            (node_id, node_id)
+        )
+
+        # 3. Delete the node itself
+        conn.execute("DELETE FROM drift_nodes WHERE id = ?", (node_id,))
+
+        # 4. Remove the vector from the sqlite-vec index
+        try:
+            conn.execute("DELETE FROM vec_embeddings WHERE rowid = ?", (node_id,))
+        except Exception as vec_exc:
+            log.warning("Could not remove vec_embeddings row for node %d: %s", node_id, vec_exc)
+
+        conn.commit()
+        log.info("Node %d deleted by %s (with links and vector).", node_id, username)
+        return {"deleted": True, "node_id": node_id}
+
+    except sqlite3.Error as exc:
+        log.error("Database error on DELETE /nodes/%d: %s", node_id, exc)
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}") from exc
+    finally:
+        conn.close()
 
 
 # ── Dev entry-point ───────────────────────────────────────────────────────────

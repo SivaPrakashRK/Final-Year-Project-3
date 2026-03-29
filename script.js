@@ -1,4 +1,41 @@
-const API = "http://localhost:8001";
+// ── API Base URLs ─────────────────────────────────────────────────────────────────
+const API      = "http://localhost:8001";
+const AUTH_API = API; // Auth endpoints share the same server
+
+// ── Theme System ──────────────────────────────────────────────────────────────────
+(function initTheme() {
+    const saved = localStorage.getItem('cc_theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', saved);
+})();
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('cc_theme', theme);
+
+    const isDark = theme === 'dark';
+    const moonIcon = document.querySelector('.theme-icon-dark');
+    const sunIcon  = document.querySelector('.theme-icon-light');
+    if (moonIcon) moonIcon.style.display = isDark ? 'block' : 'none';
+    if (sunIcon)  sunIcon.style.display  = isDark ? 'none'  : 'block';
+
+    // Update the SVG drop shadow so it's subtle in light mode
+    const shadowEl = document.querySelector('#card-shadow feDropShadow');
+    if (shadowEl) {
+        shadowEl.setAttribute('flood-opacity', isDark ? '0.35' : '0.08');
+        shadowEl.setAttribute('flood-color', isDark ? 'rgba(0,0,0,1)' : 'rgba(0,0,0,0.4)');
+        shadowEl.setAttribute('stdDeviation', isDark ? '8' : '4');
+    }
+
+    // Redraw the D3 graph so node card fills pick up the new palette
+    if (typeof renderGraph === 'function' && state.graphData.nodes.length) {
+        renderGraph();
+    }
+}
+
+
+// ── Session State ─────────────────────────────────────────────────────────────────
+let sessionToken = null;
+
 
 const state = {
     graphData: { nodes: [], links: [] },
@@ -11,7 +48,8 @@ const state = {
     diaryTags: [],
     freeformTags: [],
     sessionInterventionShown: false,
-    hoveredNode: null
+    hoveredNode: null,
+    selectedNode: null  // tracks node whose detail panel is open (for Delete key)
 };
 
 // D3 SETUP
@@ -45,9 +83,9 @@ const dropShadow = defs.append("filter")
 dropShadow.append("feDropShadow")
     .attr("dx", 0)
     .attr("dy", 4)
-    .attr("stdDeviation", 12)
-    .attr("flood-opacity", 0.4)
-    .attr("flood-color", "rgba(0,0,0,1)"); // Set to black by default, will dynamically match stroke via CSS/JS later, but standard is black/dark.
+    .attr("stdDeviation", 8)
+    .attr("flood-opacity", 0.35)
+    .attr("flood-color", "rgba(0,0,0,1)");
 
 // Arrowhead marker for chronological links
 defs.append("marker")
@@ -533,6 +571,7 @@ function renderGraph() {
     nodeGroup.selectAll("g.node-group").each(function (d) {
         const el = d3.select(this);
         const isDiary = d.entry_type === "thought_diary";
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light';
 
         // Opacity handled by updateHoverState()
         el.style("transition", "opacity 0.3s ease");
@@ -540,7 +579,11 @@ function renderGraph() {
         // Glow visibility
         el.select(".rumination-glow").attr("display", d.rumination_flag > 0 ? "block" : "none");
 
-        // Card Border Stroke base on wellness
+        // Card body fill — theme-aware
+        const cardFill = isLight ? "rgba(255, 255, 255, 0.96)" : "rgba(15, 15, 22, 0.92)";
+        el.select(".node-card").attr("fill", cardFill);
+
+        // Card Border Stroke based on wellness
         el.select(".node-card").attr("stroke", getNodeStroke(d));
 
         // Header bars Colors
@@ -548,8 +591,16 @@ function renderGraph() {
         el.select(".node-header-bar").attr("fill", headerColor);
         el.select(".node-header-bar-base").attr("fill", headerColor);
 
-        // Header Text
-        el.select(".node-type-label").text(isDiary ? "◇ diary" : "freeform");
+        // Header Text — white on coloured header bar (both themes)
+        el.select(".node-type-label").attr("fill", "#ffffff");
+
+        // Date and tag text — theme-aware
+        const dateColor   = isLight ? "rgba(30,30,60,0.55)"  : "rgba(255,255,255,0.5)";
+        const tagColor    = isLight ? "rgba(30,30,60,0.75)"  : "rgba(255,255,255,0.75)";
+        const seqColor    = isLight ? "rgba(30,30,60,0.25)"  : "rgba(255,255,255,0.25)";
+        el.select(".node-date").attr("fill", dateColor);
+        el.select(".node-tag").attr("fill", tagColor);
+        el.select(".node-sequence").attr("fill", seqColor);
 
         // Date Texts
         const dt = d.timestamp || d.date || "";
@@ -731,16 +782,68 @@ document.getElementById('search-input').addEventListener('input', (e) => {
     }, 200);
 });
 
-document.addEventListener('keydown', e => {
-    if (e.key === '/' && document.activeElement.tagName !== 'TEXTAREA'
-        && document.activeElement.tagName !== 'INPUT') {
+document.addEventListener('keydown', async e => {
+    const activeTag = document.activeElement.tagName;
+    const isTyping = activeTag === 'TEXTAREA' || activeTag === 'INPUT' || activeTag === 'SELECT';
+
+    // '/' shortcut — focus search bar
+    if (e.key === '/' && !isTyping) {
         e.preventDefault();
         document.getElementById('search-input').focus();
+        return;
+    }
+
+    // Delete key — delete the currently selected (open) node
+    if (e.key === 'Delete' && !isTyping && state.selectedNode) {
+        const node = state.selectedNode;
+        const label = (node.situation || node.automatic_thought || node.text || 'this node').substring(0, 60);
+        const confirmed = window.confirm(
+            `Delete this entry?\n\n"${label}"\n\nThis will permanently remove the node and all its connections. This cannot be undone.`
+        );
+        if (!confirmed) return;
+
+        try {
+            const res = await fetch(`${API}/nodes/${node.id}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${sessionToken}` }
+            });
+
+            if (res.status === 401) {
+                sessionStorage.clear();
+                sessionToken = null;
+                showAuthOverlay();
+                return;
+            }
+
+            if (res.ok) {
+                // Close the detail panel and clear selection
+                state.selectedNode = null;
+                document.getElementById('node-detail').classList.remove('open');
+
+                // Remove node and its links from local state
+                state.graphData.nodes = state.graphData.nodes.filter(n => n.id !== node.id);
+                state.graphData.links = state.graphData.links.filter(l => {
+                    const src = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+                    return src !== node.id && tgt !== node.id;
+                });
+
+                renderGraph();
+                refreshGalleryAfterDelete(node.id);
+            } else {
+                const err = await res.json().catch(() => ({}));
+                alert(`Could not delete node: ${err.detail || 'Unknown error'}`);
+            }
+        } catch (fetchErr) {
+            alert('Delete failed — is the server running?');
+            console.error('Delete error:', fetchErr);
+        }
     }
 });
 
 // NODE CLICK -> DETAIL PANEL
 function openNodeDetail(node) {
+    state.selectedNode = node;
     const p = document.getElementById('node-detail');
     p.classList.add('open');
 
@@ -812,6 +915,294 @@ window.openNodeDetailById = function (id) {
     if (node) openNodeDetail(node);
 };
 
+// ── Local Passcode Authentication (4-screen flow) ──────────────────────────
+
+let _resetToken = null; // held in memory between forgot-verify and reset
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function showAuthScreen(screenId) {
+    document.querySelectorAll('.auth-screen').forEach(s => s.classList.add('hidden'));
+    document.getElementById(screenId).classList.remove('hidden');
+}
+
+function showAuthOverlay(screenId = 'auth-screen-login') {
+    document.getElementById('auth-overlay').classList.remove('hidden');
+    showAuthScreen(screenId);
+    // Auto-focus first input in the active screen
+    setTimeout(() => {
+        const screen = document.getElementById(screenId);
+        const first = screen && screen.querySelector('input, select');
+        if (first) first.focus();
+    }, 60);
+}
+
+function hideAuthOverlay() {
+    document.getElementById('auth-overlay').classList.add('hidden');
+}
+
+function shakeCard() {
+    const card = document.querySelector('.auth-card');
+    card.style.animation = 'none';
+    card.offsetHeight; // force reflow
+    card.style.animation = 'shake 0.4s ease';
+    setTimeout(() => card.style.animation = '', 450);
+}
+
+function setAuthBtnLoading(textId, spinnerId, loading) {
+    document.getElementById(textId).classList.toggle('hidden', loading);
+    document.getElementById(spinnerId).classList.toggle('hidden', !loading);
+}
+
+function showErr(errId, msg) {
+    const el = document.getElementById(errId);
+    el.textContent = msg;
+    el.classList.remove('hidden');
+}
+
+function clearErr(errId) {
+    document.getElementById(errId).classList.add('hidden');
+}
+
+// ── Startup ───────────────────────────────────────────────────────────────────
+
+async function checkAuth() {
+    // 1. Restore existing session token
+    sessionToken = sessionStorage.getItem('session_token');
+    if (sessionToken) {
+        try {
+            const res = await fetch(`${AUTH_API}/auth/check`, {
+                headers: { 'Authorization': `Bearer ${sessionToken}` }
+            });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.valid) { hideAuthOverlay(); return true; }
+            }
+        } catch (_) {}
+        sessionStorage.removeItem('session_token');
+        sessionToken = null;
+    }
+
+    // 2. Check registration status
+    try {
+        const res = await fetch(`${AUTH_API}/auth/status`);
+        if (res.ok) {
+            const data = await res.json();
+            showAuthOverlay(data.registered ? 'auth-screen-login' : 'auth-screen-register');
+            return false;
+        }
+    } catch (_) {}
+
+    showAuthOverlay('auth-screen-login');
+    return false;
+}
+
+// ── Screen wiring: navigation links ──────────────────────────────────────────
+
+document.getElementById('go-forgot').addEventListener('click', async (e) => {
+    e.preventDefault();
+    clearErr('forgot-error');
+    document.getElementById('forgot-question-text').textContent = 'Loading your security question…';
+    showAuthScreen('auth-screen-forgot');
+    document.getElementById('forgot-answer').value = '';
+
+    try {
+        const res = await fetch(`${AUTH_API}/auth/forgot/question`);
+        if (res.ok) {
+            const data = await res.json();
+            document.getElementById('forgot-question-text').textContent = data.question;
+        } else {
+            document.getElementById('forgot-question-text').textContent = 'Could not load question. Please restart the app.';
+        }
+    } catch (_) {
+        document.getElementById('forgot-question-text').textContent = 'Server not reachable.';
+    }
+});
+
+document.getElementById('go-login-from-forgot').addEventListener('click', (e) => {
+    e.preventDefault();
+    showAuthScreen('auth-screen-login');
+});
+
+// ── Screen 2: REGISTER ───────────────────────────────────────────────────────
+
+document.getElementById('register-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErr('register-error');
+
+    const passcode  = document.getElementById('reg-passcode').value;
+    const confirm   = document.getElementById('reg-passcode-confirm').value;
+    const question  = document.getElementById('reg-security-question').value;
+    const answer    = document.getElementById('reg-security-answer').value.trim();
+
+    if (passcode.length < 4)        { shakeCard(); return showErr('register-error', 'Passcode must be at least 4 characters.'); }
+    if (passcode !== confirm)        { shakeCard(); return showErr('register-error', 'Passcodes do not match.'); }
+    if (!question)                   { shakeCard(); return showErr('register-error', 'Please choose a security question.'); }
+    if (!answer)                     { shakeCard(); return showErr('register-error', 'Security answer cannot be empty.'); }
+
+    setAuthBtnLoading('register-btn-text', 'register-btn-spinner', true);
+    try {
+        const res = await fetch(`${AUTH_API}/auth/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ passcode, security_question: question, security_answer: answer })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            sessionToken = data.session_token;
+            sessionStorage.setItem('session_token', sessionToken);
+            sessionStorage.setItem('username', data.username);
+            hideAuthOverlay();
+            await loadGraph();
+        } else {
+            const err = await res.json().catch(() => ({}));
+            shakeCard();
+            showErr('register-error', err.detail || 'Registration failed.');
+        }
+    } catch (_) {
+        shakeCard();
+        showErr('register-error', 'Unable to connect. Make sure python app.py is running.');
+    } finally {
+        setAuthBtnLoading('register-btn-text', 'register-btn-spinner', false);
+    }
+});
+
+// ── Screen 1: LOGIN ───────────────────────────────────────────────────────────
+
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErr('login-error');
+
+    const passcode = document.getElementById('login-passcode').value;
+    setAuthBtnLoading('login-btn-text', 'login-btn-spinner', true);
+    document.getElementById('login-passcode').disabled = true;
+
+    try {
+        const res = await fetch(`${AUTH_API}/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ passcode })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            sessionToken = data.session_token;
+            sessionStorage.setItem('session_token', sessionToken);
+            sessionStorage.setItem('username', data.username);
+            hideAuthOverlay();
+            await loadGraph();
+            document.getElementById('login-passcode').value = '';
+        } else {
+            const err = await res.json().catch(() => ({}));
+            shakeCard();
+            showErr('login-error', err.detail || 'Incorrect passcode. Please try again.');
+            document.getElementById('login-passcode').value = '';
+            document.getElementById('login-passcode').focus();
+        }
+    } catch (_) {
+        shakeCard();
+        showErr('login-error', 'Unable to connect. Make sure python app.py is running.');
+    } finally {
+        setAuthBtnLoading('login-btn-text', 'login-btn-spinner', false);
+        document.getElementById('login-passcode').disabled = false;
+    }
+});
+
+// ── Screen 3: FORGOT — verify security answer ────────────────────────────────
+
+document.getElementById('forgot-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErr('forgot-error');
+
+    const answer = document.getElementById('forgot-answer').value.trim();
+    if (!answer) { shakeCard(); return showErr('forgot-error', 'Please enter your answer.'); }
+
+    setAuthBtnLoading('forgot-btn-text', 'forgot-btn-spinner', true);
+    try {
+        const res = await fetch(`${AUTH_API}/auth/forgot/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ security_answer: answer })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            _resetToken = data.reset_token;
+            showAuthScreen('auth-screen-reset');
+            document.getElementById('reset-passcode').focus();
+        } else {
+            const err = await res.json().catch(() => ({}));
+            shakeCard();
+            showErr('forgot-error', err.detail || 'Incorrect answer. Please try again.');
+            document.getElementById('forgot-answer').value = '';
+        }
+    } catch (_) {
+        shakeCard();
+        showErr('forgot-error', 'Unable to connect. Make sure python app.py is running.');
+    } finally {
+        setAuthBtnLoading('forgot-btn-text', 'forgot-btn-spinner', false);
+    }
+});
+
+// ── Screen 4: RESET PASSCODE ─────────────────────────────────────────────────
+
+document.getElementById('reset-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearErr('reset-error');
+
+    const passcode = document.getElementById('reset-passcode').value;
+    const confirm  = document.getElementById('reset-passcode-confirm').value;
+
+    if (passcode.length < 4)  { shakeCard(); return showErr('reset-error', 'Passcode must be at least 4 characters.'); }
+    if (passcode !== confirm)  { shakeCard(); return showErr('reset-error', 'Passcodes do not match.'); }
+    if (!_resetToken)          { shakeCard(); return showErr('reset-error', 'Reset session expired. Please start recovery again.'); }
+
+    setAuthBtnLoading('reset-btn-text', 'reset-btn-spinner', true);
+    try {
+        const res = await fetch(`${AUTH_API}/auth/forgot/reset`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reset_token: _resetToken, new_passcode: passcode })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            _resetToken = null;
+            sessionToken = data.session_token;
+            sessionStorage.setItem('session_token', sessionToken);
+            sessionStorage.setItem('username', data.username);
+            hideAuthOverlay();
+            await loadGraph();
+        } else {
+            const err = await res.json().catch(() => ({}));
+            shakeCard();
+            showErr('reset-error', err.detail || 'Reset failed. Please try account recovery again.');
+            _resetToken = null;
+        }
+    } catch (_) {
+        shakeCard();
+        showErr('reset-error', 'Unable to connect. Make sure python app.py is running.');
+    } finally {
+        setAuthBtnLoading('reset-btn-text', 'reset-btn-spinner', false);
+    }
+});
+
+// ── Auto-logout: check session every 60 seconds ───────────────────────────────
+setInterval(async () => {
+    if (!sessionToken) return;
+    try {
+        const res = await fetch(`${AUTH_API}/auth/check`, {
+            headers: { 'Authorization': `Bearer ${sessionToken}` }
+        });
+        if (res.ok) {
+            const data = await res.json();
+            if (!data.valid) {
+                sessionStorage.clear();
+                sessionToken = null;
+                showAuthOverlay('auth-screen-login');
+            }
+        }
+    } catch (_) { /* network error — ignore */ }
+}, 60_000);
+
+
 // FORM SUBMISSION (analyze Entry)
 async function analyseEntry(payload) {
     document.getElementById('loading-overlay').classList.remove('hidden');
@@ -820,9 +1211,19 @@ async function analyseEntry(payload) {
     try {
         const res = await fetch(`${API}/analyze_thought`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${sessionToken}`
+            },
             body: JSON.stringify(payload)
         });
+
+        if (res.status === 401) {
+            sessionStorage.clear();
+            sessionToken = null;
+            showAuthOverlay();
+            return;
+        }
 
         if (!res.ok) throw new Error("API failed");
 
@@ -945,9 +1346,20 @@ async function saveEntry(approvedLinksArr) {
     try {
         const res = await fetch(`${API}/save_thought`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${sessionToken}`
+            },
             body: JSON.stringify(finalPayload)
         });
+
+        if (res.status === 401) {
+            sessionStorage.clear();
+            sessionToken = null;
+            showAuthOverlay();
+            return;
+        }
+
         if (!res.ok) throw new Error("Save API failed");
 
         clearForms();
@@ -982,10 +1394,19 @@ function clearForms() {
 // FETCH GRAPH
 async function loadGraph() {
     try {
-        const res = await fetch(`${API}/get_graph_data`);
+        const res = await fetch(`${API}/get_graph_data`, {
+            headers: { 'Authorization': `Bearer ${sessionToken}` }
+        });
+        if (res.status === 401) {
+            sessionStorage.clear();
+            sessionToken = null;
+            showAuthOverlay();
+            return;
+        }
         if (res.ok) {
             state.graphData = await res.json();
             renderGraph();
+            if (currentView === 'gallery') renderGallery();
         }
     } catch (err) {
         console.error("Graph fetch error", err);
@@ -1052,17 +1473,250 @@ function renderTags(wrap, tagsArray, inputId, wrapId) {
     });
 }
 
-// BINDINGS
-document.addEventListener("DOMContentLoaded", () => {
+// ── GALLERY VIEW ─────────────────────────────────────────────────────────────
+
+/**
+ * Current view state — 'graph' or 'gallery'
+ */
+let currentView = 'graph';
+
+/**
+ * Renders the gallery view from state.graphData.nodes
+ * Groups nodes by Month/Year, newest month first.
+ * Each group has a collapsible header with a chevron arrow.
+ */
+function renderGallery() {
+    const scroll = document.getElementById('gallery-scroll');
+    const emptyState = document.getElementById('gallery-empty');
+
+    // Clear all month groups (keep the empty state div)
+    scroll.querySelectorAll('.month-group').forEach(el => el.remove());
+
+    const nodes = state.graphData.nodes;
+    if (!nodes || nodes.length === 0) {
+        emptyState.classList.remove('hidden');
+        return;
+    }
+    emptyState.classList.add('hidden');
+
+    // Group nodes by "MMMM YYYY" label
+    const monthMap = new Map(); // key: "2026-03" → { label: "March 2026", nodes: [] }
+
+    nodes.forEach(node => {
+        const dt = node.timestamp || node.date;
+        const d = dt ? new Date(dt) : new Date();
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const label = d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+        if (!monthMap.has(key)) {
+            monthMap.set(key, { label, nodes: [] });
+        }
+        monthMap.get(key).nodes.push(node);
+    });
+
+    // Sort month keys descending (newest first)
+    const sortedKeys = Array.from(monthMap.keys()).sort((a, b) => b.localeCompare(a));
+
+    sortedKeys.forEach(key => {
+        const group = monthMap.get(key);
+        // Sort nodes within each month newest-first
+        group.nodes.sort((a, b) => {
+            const da = new Date(a.timestamp || a.date || 0);
+            const db = new Date(b.timestamp || b.date || 0);
+            return db - da;
+        });
+
+        const groupEl = document.createElement('div');
+        groupEl.className = 'month-group';
+        groupEl.dataset.month = key;
+
+        // Month header (clickable to toggle collapse)
+        const header = document.createElement('div');
+        header.className = 'month-group-header';
+        header.innerHTML = `
+            <svg class="month-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+            <span class="month-label">${group.label}</span>
+            <span class="month-count-badge">${group.nodes.length} ${group.nodes.length === 1 ? 'entry' : 'entries'}</span>
+        `;
+        header.addEventListener('click', () => {
+            groupEl.classList.toggle('collapsed');
+        });
+
+        // Cards grid
+        const grid = document.createElement('div');
+        grid.className = 'month-cards-grid';
+
+        group.nodes.forEach(node => {
+            const card = buildNoteCard(node);
+            grid.appendChild(card);
+        });
+
+        groupEl.appendChild(header);
+        groupEl.appendChild(grid);
+        scroll.appendChild(groupEl);
+    });
+}
+
+/**
+ * Builds a single note card element for a node.
+ */
+function buildNoteCard(node) {
+    const isDiary = node.entry_type === 'thought_diary';
+    const card = document.createElement('div');
+    card.className = `note-card ${isDiary ? 'entry-diary' : 'entry-freeform'}`;
+    card.dataset.nodeId = node.id;
+
+    const dt = node.timestamp || node.date;
+    const formattedDate = dt ? new Date(dt).toLocaleDateString('en-US', {
+        month: 'short', day: 'numeric'
+    }) : '';
+
+    const title = (node.situation || node.automatic_thought || node.text || 'Untitled').substring(0, 120);
+    const preview = (node.automatic_thought || node.text || node.situation || '').substring(0, 180);
+
+    const wellness = (node.wellness_label || node.wellness || '').toLowerCase();
+    let wellnessClass = 'neutral';
+    if (wellness.includes('positive')) wellnessClass = 'positive';
+    else if (wellness.includes('negative')) wellnessClass = 'negative';
+
+    const tagsHtml = (node.tags && node.tags.length)
+        ? node.tags.slice(0, 3).map(t => `<span class="note-card-tag">#${t}</span>`).join('')
+        : '';
+
+    card.innerHTML = `
+        <div class="note-card-top">
+            <span class="note-card-type">${isDiary ? '◇ diary' : 'freeform'}</span>
+            <span class="note-card-date">${formattedDate}</span>
+        </div>
+        <div class="note-card-title">${title}</div>
+        ${preview && preview !== title ? `<div class="note-card-preview">${preview}</div>` : ''}
+        <div class="note-card-footer">
+            <div class="note-card-tags">${tagsHtml}</div>
+            <div class="note-wellness-dot ${wellnessClass}" title="${node.wellness_label || node.wellness || 'Neutral'}"></div>
+        </div>
+        <div class="note-card-delete-hint">select & press Delete</div>
+    `;
+
+    // Click → open the shared detail panel (same as graph)
+    card.addEventListener('click', () => {
+        openNodeDetail(node);
+    });
+
+    return card;
+}
+
+/**
+ * Refreshes a single node card in the gallery after data changes,
+ * or removes it if the node no longer exists.
+ */
+function refreshGalleryAfterDelete(deletedNodeId) {
+    const card = document.querySelector(`.note-card[data-node-id="${deletedNodeId}"]`);
+    if (!card) return;
+
+    const grid = card.closest('.month-cards-grid');
+    const groupEl = card.closest('.month-group');
+    card.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+    card.style.opacity = '0';
+    card.style.transform = 'scale(0.95)';
+
+    setTimeout(() => {
+        card.remove();
+
+        // If the grid is now empty, remove the entire month group
+        if (grid && grid.querySelectorAll('.note-card').length === 0) {
+            groupEl && groupEl.remove();
+        } else if (groupEl) {
+            // Update the count badge
+            const remaining = grid ? grid.querySelectorAll('.note-card').length : 0;
+            const badge = groupEl.querySelector('.month-count-badge');
+            if (badge) badge.textContent = `${remaining} ${remaining === 1 ? 'entry' : 'entries'}`;
+        }
+
+        // Show empty state if nothing left
+        const scroll = document.getElementById('gallery-scroll');
+        if (scroll && scroll.querySelectorAll('.month-group').length === 0) {
+            const emptyState = document.getElementById('gallery-empty');
+            if (emptyState) emptyState.classList.remove('hidden');
+        }
+    }, 300);
+}
+
+// ── VIEW TAB SWITCHING ────────────────────────────────────────────────────────
+
+function switchView(view) {
+    currentView = view;
+
+    const graphPanel = document.getElementById('graph-panel');
+    const galleryPanel = document.getElementById('gallery-panel');
+    const entryPanel = document.getElementById('entry-panel');
+    const commandCenter = document.getElementById('command-center');
+    const tabGraph = document.getElementById('tab-graph');
+    const tabGallery = document.getElementById('tab-gallery');
+
+    if (view === 'gallery') {
+        // Show gallery, hide graph
+        graphPanel.classList.add('hidden');
+        galleryPanel.classList.remove('hidden');
+
+        // Entry panel stays visible in gallery too (for adding new nodes)
+        // Command center can stay visible (search)
+        tabGraph.classList.remove('active');
+        tabGallery.classList.add('active');
+
+        // Render gallery with current graph data
+        renderGallery();
+    } else {
+        // Show graph, hide gallery
+        graphPanel.classList.remove('hidden');
+        galleryPanel.classList.add('hidden');
+
+        tabGraph.classList.add('active');
+        tabGallery.classList.remove('active');
+    }
+}
+
+// ── BINDINGS
+document.addEventListener("DOMContentLoaded", async () => {
+
+    // 1. Check auth FIRST — only proceed to init app if authenticated
+    const authed = await checkAuth();
 
     document.querySelector('.graph-panel').addEventListener('click', (e) => {
         if (e.target.tagName === 'svg' || e.target.id === 'graph-svg') {
+            state.selectedNode = null;
             document.getElementById('node-detail').classList.remove('open');
         }
     });
 
-    document.getElementById('detail-close').onclick = () => document.getElementById('node-detail').classList.remove('open');
+    document.getElementById('detail-close').onclick = () => {
+        state.selectedNode = null;
+        document.getElementById('node-detail').classList.remove('open');
+    };
     document.getElementById('hitl-close').onclick = () => document.getElementById('hitl-modal').classList.add('hidden');
+
+    // ── View tab buttons
+    document.querySelectorAll('.view-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            switchView(tab.dataset.view);
+        });
+    });
+
+    // ── Theme toggle button
+    const themeBtn = document.getElementById('theme-toggle');
+    if (themeBtn) {
+        // Sync icons to current theme (in case saved preference is light)
+        const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+        applyTheme(currentTheme);
+
+        themeBtn.addEventListener('click', () => {
+            const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            applyTheme(next);
+        });
+    }
+
+
+
 
     document.querySelectorAll('.mode-btn').forEach(b => {
         b.onclick = () => {
@@ -1078,6 +1732,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         };
     });
+
 
     setupTagInput('ff-tag-input', 'ff-tags-container', state.freeformTags);
     setupTagInput('diary-tag-input', 'diary-tags-container', state.diaryTags);
@@ -1139,5 +1794,6 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    loadGraph();
+    // Only load graph if already authenticated (checkAuth handles it on login success)
+    if (authed) await loadGraph();
 });
